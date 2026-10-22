@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -27,6 +28,10 @@ from pseudopeople.utilities import (
     to_string_expr,
 )
 
+# Beyond a few concurrent shards, Polars' own multithreading already uses the CPU,
+# and each additional shard in flight costs memory.
+DEFAULT_MAX_WORKERS = 4
+
 
 def _generate_dataset(
     dataset: Dataset,
@@ -36,6 +41,7 @@ def _generate_dataset(
     user_filters: List[tuple],
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Helper for generating noised datasets.
@@ -56,6 +62,9 @@ def _generate_dataset(
         Directory to write one noised parquet file per input shard to. If
         given, a LazyFrame scanning the written files is returned instead of
         a DataFrame, so the full dataset never has to fit in memory.
+    :param n_workers:
+        Number of data files to noise at the same time. Defaults to
+        DEFAULT_MAX_WORKERS (capped at the number of files).
     :return:
         Noised dataset data
     """
@@ -80,31 +89,48 @@ def _generate_dataset(
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
 
-    noised_shards = []
-    written_files = []
-    iterator = (
-        tqdm(data_file_paths, desc="Noising data", leave=False)
-        if len(data_file_paths) > 1
-        else data_file_paths
-    )
-    for data_file_index, data_file_path in enumerate(iterator):
+    if n_workers is None:
+        n_workers = DEFAULT_MAX_WORKERS
+    n_workers = max(1, min(n_workers, len(data_file_paths)))
+
+    def noise_shard(data_file_index: int) -> Union[pl.DataFrame, Path, None]:
+        data_file_path = data_file_paths[data_file_index]
         logger.debug(f"Loading data from {data_file_path}.")
         data = load_standard_dataset(data_file_path, user_filters)
         if data.is_empty():
-            continue
+            return None
         # Use a different seed for each data file/shard, otherwise the randomness will duplicate
         # and the Nth row in each shard will get the same noise
         data_path_seed = f"{seed}_{data_file_index}"
         noised_data = _coerce_dtypes(
-            _prep_and_noise_dataset(data, dataset, configuration_tree, data_path_seed),
+            _prep_and_noise_dataset(
+                data,
+                dataset,
+                configuration_tree,
+                data_path_seed,
+                progress_bar=len(data_file_paths) == 1,
+            ),
             dataset,
         )
         if output_path is None:
-            noised_shards.append(noised_data)
-        else:
-            file_path = output_path / f"{dataset.name}_{data_file_index}.parquet"
-            noised_data.write_parquet(file_path)
-            written_files.append(file_path)
+            return noised_data
+        file_path = output_path / f"{dataset.name}_{data_file_index}.parquet"
+        noised_data.write_parquet(file_path)
+        return file_path
+
+    shard_indices = range(len(data_file_paths))
+    # Polars releases the GIL, so threads let several shards use the CPU at once.
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = executor.map(noise_shard, shard_indices)
+        if len(data_file_paths) > 1:
+            results = tqdm(
+                results, total=len(data_file_paths), desc="Noising data", leave=False
+            )
+        # executor.map yields in shard order, so output order does not depend on n_workers
+        results = [result for result in results if result is not None]
+
+    noised_shards = [r for r in results if isinstance(r, pl.DataFrame)]
+    written_files = [r for r in results if isinstance(r, Path)]
 
     # Check if all shards for the dataset are empty
     if not noised_shards and not written_files:
@@ -195,7 +221,9 @@ def _clean_input_data(
     categorical (dictionary-encoded) columns are plain strings, and output
     string columns are strings.
     """
-    categorical = [c for c, dtype in data.schema.items() if dtype in (pl.Categorical, pl.Enum)]
+    categorical = [
+        c for c, dtype in data.schema.items() if dtype in (pl.Categorical, pl.Enum)
+    ]
     data = data.with_columns(pl.col(categorical).cast(pl.String))
     data = data.with_columns(
         to_string_expr(
@@ -260,6 +288,7 @@ def generate_decennial_census(
     state: Optional[str] = None,
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople decennial census dataset which represents
@@ -313,6 +342,13 @@ def generate_decennial_census(
         written files is returned. Default is `None`, which returns a
         Polars DataFrame.
 
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
+
     :return:
 
         A DataFrame of simulated decennial census data.
@@ -339,7 +375,14 @@ def generate_decennial_census(
             (DATASETS.census.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.census, source, seed, config, user_filters, verbose, output_path=output_path
+        DATASETS.census,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -351,6 +394,7 @@ def generate_american_community_survey(
     state: Optional[str] = None,
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople ACS dataset which represents simulated
@@ -411,6 +455,13 @@ def generate_american_community_survey(
         written files is returned. Default is `None`, which returns a
         Polars DataFrame.
 
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
+
     :return:
 
         A DataFrame of simulated ACS data.
@@ -454,7 +505,14 @@ def generate_american_community_survey(
             [(DATASETS.acs.state_column_name, "==", get_state_abbreviation(state))]
         )
     return _generate_dataset(
-        DATASETS.acs, source, seed, config, user_filters, verbose, output_path=output_path
+        DATASETS.acs,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -466,6 +524,7 @@ def generate_current_population_survey(
     state: Optional[str] = None,
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople CPS dataset which represents simulated
@@ -527,6 +586,13 @@ def generate_current_population_survey(
         written files is returned. Default is `None`, which returns a
         Polars DataFrame.
 
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
+
     :return:
 
         A DataFrame of simulated CPS data.
@@ -570,7 +636,14 @@ def generate_current_population_survey(
             [(DATASETS.cps.state_column_name, "==", get_state_abbreviation(state))]
         )
     return _generate_dataset(
-        DATASETS.cps, source, seed, config, user_filters, verbose, output_path=output_path
+        DATASETS.cps,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -582,6 +655,7 @@ def generate_taxes_w2_and_1099(
     state: Optional[str] = None,
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople W2 and 1099 tax dataset which represents
@@ -634,6 +708,13 @@ def generate_taxes_w2_and_1099(
         written files is returned. Default is `None`, which returns a
         Polars DataFrame.
 
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
+
     :return:
 
         A DataFrame of simulated W2 and 1099 tax data.
@@ -661,7 +742,14 @@ def generate_taxes_w2_and_1099(
             (DATASETS.tax_w2_1099.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.tax_w2_1099, source, seed, config, user_filters, verbose, output_path=output_path
+        DATASETS.tax_w2_1099,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -673,6 +761,7 @@ def generate_women_infants_and_children(
     state: Optional[str] = None,
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople WIC dataset which represents a simulated
@@ -736,6 +825,13 @@ def generate_women_infants_and_children(
         written files is returned. Default is `None`, which returns a
         Polars DataFrame.
 
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
+
     :return:
 
         A DataFrame of simulated WIC data.
@@ -763,7 +859,14 @@ def generate_women_infants_and_children(
             (DATASETS.wic.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.wic, source, seed, config, user_filters, verbose, output_path=output_path
+        DATASETS.wic,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -774,6 +877,7 @@ def generate_social_security(
     year: Optional[int] = 2020,
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople SSA dataset which represents simulated
@@ -817,6 +921,13 @@ def generate_social_security(
         written files is returned. Default is `None`, which returns a
         Polars DataFrame.
 
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
+
     :return:
 
         A DataFrame of simulated SSA data.
@@ -849,7 +960,14 @@ def generate_social_security(
             raise ValueError(f"Invalid year provided: '{year}'")
         seed = seed * 10_000 + year
     return _generate_dataset(
-        DATASETS.ssa, source, seed, config, user_filters, verbose, output_path=output_path
+        DATASETS.ssa,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -861,6 +979,7 @@ def generate_taxes_1040(
     state: Optional[str] = None,
     verbose: bool = False,
     output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople 1040 tax dataset which represents simulated
@@ -913,6 +1032,13 @@ def generate_taxes_1040(
         written files is returned. Default is `None`, which returns a
         Polars DataFrame.
 
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
+
     :return:
 
         A DataFrame of simulated 1040 tax data.
@@ -940,7 +1066,14 @@ def generate_taxes_1040(
             (DATASETS.tax_1040.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.tax_1040, source, seed, config, user_filters, verbose, output_path=output_path
+        DATASETS.tax_1040,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 

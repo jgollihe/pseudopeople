@@ -183,7 +183,7 @@ def test_noise_order(mocker, noise_order_data, dataset):
     # above causing duplicates in the call list. Call order is each instance a noise
     # function is called. Here we grab the string of the noise type for one mock method
     # call and not the second method.
-    call_order = [x[0] for x in mock.mock_calls if type(x[1][0]) == str]
+    call_order = [x[0] for x in mock.mock_calls if isinstance(x[1][0], str)]
     row_order = [
         noise_type
         for noise_type in NOISE_TYPES._fields

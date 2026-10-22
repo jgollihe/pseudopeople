@@ -221,7 +221,9 @@ def test_guardian_duplication():
     assert noised[ROW_ID].is_unique().all()
 
     # Check address information is copied in new rows
-    guardians = dummy_data.filter(pl.col("simulant_id").is_in(dummy_data["guardian_1"].implode()))
+    guardians = dummy_data.filter(
+        pl.col("simulant_id").is_in(dummy_data["guardian_1"].implode())
+    )
     for dependent in duplicated.iter_rows(named=True):
         guardian_ids = [g for g in (dependent["guardian_1"], dependent["guardian_2"]) if g]
         candidate_guardians = guardians.filter(pl.col("simulant_id").is_in(guardian_ids))

@@ -41,10 +41,15 @@ class Randomness:
         return get_hash(f"{self.seed}_{key}")
 
     def uniform(self, key: str, *by: pl.Expr | str) -> pl.Expr:
-        """Uniform [0, 1) draw per row, keyed on the row id plus any ``by`` expressions."""
-        columns = [pl.col(ROW_ID), *(pl.col(b) if isinstance(b, str) else b for b in by)]
-        hashed_input = columns[0] if len(columns) == 1 else pl.struct(columns)
-        return _to_unit_interval(hashed_input.hash(self.key_seed(key)))
+        """Uniform [0, 1) draw per row, keyed on the row id plus any integer ``by`` expressions."""
+        seed = self.key_seed(key)
+        # Chain hashes rather than hashing a struct: struct hashing in Polars 2.0
+        # can panic on multi-chunk data in the streaming engine.
+        hashed = pl.col(ROW_ID).hash(seed)
+        for b in by:
+            b = pl.col(b) if isinstance(b, str) else b
+            hashed = (hashed ^ b.cast(pl.UInt64)).hash(seed)
+        return _to_unit_interval(hashed)
 
     def choice_index(self, key: str, n_options: pl.Expr | int, *by: pl.Expr | str) -> pl.Expr:
         """Uniform integer in [0, n_options) per row."""
@@ -63,11 +68,17 @@ class Randomness:
         for option, weight in zip(options[:-1], weights[:-1]):
             cumulative += weight / total
             branch = draw < cumulative
-            expr = pl.when(branch).then(pl.lit(option)) if expr is None else expr.when(branch).then(pl.lit(option))
+            expr = (
+                pl.when(branch).then(pl.lit(option))
+                if expr is None
+                else expr.when(branch).then(pl.lit(option))
+            )
         last = pl.lit(options[-1])
         return last if expr is None else expr.otherwise(last)
 
-    def from_options(self, key: str, options: list | pl.Series, *by: pl.Expr | str) -> pl.Expr:
+    def from_options(
+        self, key: str, options: list | pl.Series, *by: pl.Expr | str
+    ) -> pl.Expr:
         """Uniformly choose one of ``options`` per row."""
         options = options if isinstance(options, pl.Series) else pl.Series(options)
         return pl.lit(options).gather(self.choice_index(key, len(options), *by))

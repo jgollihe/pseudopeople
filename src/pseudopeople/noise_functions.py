@@ -68,20 +68,37 @@ def _census_omission_noise_levels(
             default=0.0,
             return_dtype=pl.Float64,
         )
+        .fill_null(0.0)
+    )
+    # A single integer-keyed lookup on (sex, age) is much faster than a when/then
+    # chain over every (sex, age bin) pair.
+    sexes = list(data_values.DO_NOT_RESPOND_ADDITIVE_PROBABILITY_BY_SEX_AGE)
+    edges = data_values.DO_NOT_RESPOND_AGE_BIN_EDGES
+    max_age = edges[-1]
+    effect_by_key = {
+        sex_index * max_age + age: effect
+        for sex_index, sex in enumerate(sexes)
+        for lower, upper, effect in zip(
+            edges[:-1],
+            edges[1:],
+            data_values.DO_NOT_RESPOND_ADDITIVE_PROBABILITY_BY_SEX_AGE[sex],
+        )
+        for age in range(lower, upper)
+    }
+    sex_index = (
+        pl.col("sex")
+        .cast(pl.String)
+        .replace_strict(
+            {sex: i for i, sex in enumerate(sexes)}, default=None, return_dtype=pl.Int64
+        )
     )
     age = pl.col("age").cast(pl.Int64)
-    sex = pl.col("sex").cast(pl.String)
-    edges = data_values.DO_NOT_RESPOND_AGE_BIN_EDGES
-    sex_age_effect = None
-    for sex_value, effects in data_values.DO_NOT_RESPOND_ADDITIVE_PROBABILITY_BY_SEX_AGE.items():
-        for lower, upper, effect in zip(edges[:-1], edges[1:], effects):
-            in_bin = (sex == sex_value) & (age >= lower) & (age < upper)
-            sex_age_effect = (
-                pl.when(in_bin).then(effect)
-                if sex_age_effect is None
-                else sex_age_effect.when(in_bin).then(effect)
-            )
-    sex_age_effect = sex_age_effect.otherwise(0.0)
+    sex_age_effect = (
+        pl.when((age >= edges[0]) & (age < max_age))
+        .then(sex_index * max_age + age)
+        .replace_strict(effect_by_key, default=0.0, return_dtype=pl.Float64)
+        .fill_null(0.0)
+    )
     return (pl.lit(base_probability) + race_effect + sex_age_effect).clip(0.0, 1.0)
 
 
@@ -133,7 +150,7 @@ def apply_do_not_respond(
         noise_levels = 0.5 + noise_levels / 2
 
     omitted = randomness.uniform(f"do_not_respond_{dataset_name}") < noise_levels
-    return dataset_data.filter(~omitted)
+    return dataset_data.filter(~omitted.fill_null(False))
 
 
 def duplicate_with_guardian(
@@ -168,7 +185,9 @@ def duplicate_with_guardian(
     # The guardian's year always equals the dependent's (it is a join key),
     # so it is never copied.
     copied_columns = [c for c in GUARDIAN_DUPLICATION_ADDRESS_COLUMNS if c != "year"]
-    guardian_addresses = dataset_data.select("simulant_id", *GUARDIAN_DUPLICATION_ADDRESS_COLUMNS)
+    guardian_addresses = dataset_data.select(
+        "simulant_id", *GUARDIAN_DUPLICATION_ADDRESS_COLUMNS
+    )
 
     def _with_guardian_addresses(dependents: pl.DataFrame) -> pl.DataFrame:
         # Join twice to check if either guardian lives at a separate location from the dependent.
@@ -391,12 +410,13 @@ def misreport_ages(
     return _column_noise_result(data, new_age, column_name)
 
 
-def _explode_characters(data: pl.DataFrame, column_name: str) -> pl.DataFrame:
+def _explode_characters(data: pl.LazyFrame, column_name: str) -> pl.LazyFrame:
     """One row per character: (row position, row id, character position, character).
 
     Row positions are taken from an existing ``_ROW`` column if there is one.
     """
-    row = pl.col(_ROW) if _ROW in data.columns else pl.int_range(pl.len(), dtype=pl.UInt32)
+    has_row = _ROW in data.collect_schema().names()
+    row = pl.col(_ROW) if has_row else pl.int_range(pl.len(), dtype=pl.UInt32)
     return (
         data.select(
             row.alias(_ROW),
@@ -408,12 +428,14 @@ def _explode_characters(data: pl.DataFrame, column_name: str) -> pl.DataFrame:
     )
 
 
-def _implode_characters(exploded: pl.DataFrame, column_name: str) -> pl.Series:
+def _implode_characters(exploded: pl.LazyFrame, column_name: str) -> pl.Series:
     return (
-        exploded.group_by(_ROW, maintain_order=True)
-        .agg(pl.col(_CHAR).str.join(""))
-        .sort(_ROW)[_CHAR]
-        .alias(column_name)
+        exploded.group_by(_ROW)
+        .agg(pl.col(_CHAR).sort_by(_POS).str.join(""))
+        .sort(_ROW)
+        .select(pl.col(_CHAR).alias(column_name))
+        .collect()
+        .to_series()
     )
 
 
@@ -442,7 +464,7 @@ def write_wrong_digits(
         randomness.uniform(key, _POS) < token_noise_level
     )
     random_digit = randomness.choice_index(f"{key}_digit", 10, _POS).cast(pl.String)
-    exploded = _explode_characters(data, column_name).with_columns(
+    exploded = _explode_characters(data.lazy(), column_name).with_columns(
         pl.when(replace).then(random_digit).otherwise(char).alias(_CHAR)
     )
     return _implode_characters(exploded, column_name)
@@ -565,9 +587,9 @@ def leave_blanks(
     :param randomness: Randomness source.
     :param column_name: String for column that will be noised
     """
-    return pl.repeat(
-        None, data.height, dtype=data.schema[column_name], eager=True
-    ).alias(column_name)
+    return pl.repeat(None, data.height, dtype=data.schema[column_name], eager=True).alias(
+        column_name
+    )
 
 
 def make_typos(
@@ -602,9 +624,9 @@ def make_typos(
         randomness.choice_index(f"{key}_replacement", pl.col("n_options"), _POS)
     )
     exploded = (
-        _explode_characters(data, column_name)
+        _explode_characters(data.lazy(), column_name)
         .join(
-            load_qwerty_errors_data(),
+            load_qwerty_errors_data().lazy(),
             left_on=_CHAR,
             right_on=TOKEN,
             how="left",
@@ -670,35 +692,16 @@ def _corrupt_tokens(
     left-to-right "skip past corrupted tokens" rule is resolved exactly in a
     few vectorized passes.
     """
-    rows = data.select(
+    rows = data.lazy().select(
         pl.int_range(pl.len(), dtype=pl.UInt32).alias(_ROW),
         ROW_ID,
         pl.col(column_name),
         pl.col(column_name).str.len_chars().cast(pl.Int64).alias(_LEN),
     )
-    positions = (
-        rows.filter(pl.col(_LEN) > 0)
-        .with_columns(pl.int_ranges(0, pl.col(_LEN)).alias(_POS))
-        .explode(_POS)
+    errors = errors.lazy().with_columns(
+        pl.col(TOKEN).str.len_chars().cast(pl.Int64).alias(_TOKEN_LENGTH)
     )
-    errors = errors.with_columns(pl.col(TOKEN).str.len_chars().cast(pl.Int64).alias(_TOKEN_LENGTH))
-
-    candidates = []
-    for token_length in sorted(errors[_TOKEN_LENGTH].unique()):
-        candidates.append(
-            positions.filter(pl.col(_POS) + token_length <= pl.col(_LEN))
-            .with_columns(
-                pl.col(column_name).str.slice(pl.col(_POS), token_length).alias(TOKEN),
-                pl.lit(token_length, dtype=pl.Int64).alias(_TOKEN_LENGTH),
-            )
-            .join(errors, on=[TOKEN, _TOKEN_LENGTH], how="inner")
-            .filter(
-                randomness.uniform(addl_key, _POS, _TOKEN_LENGTH) < token_probability
-            )
-        )
-    candidates = pl.concat(candidates)
-    if candidates.is_empty():
-        return data[column_name]
+    token_lengths = errors.select(_TOKEN_LENGTH).unique()
 
     # Longer tokens to-be-corrupted take precedence over shorter ones at the same position.
     # Only draw which corruption to use when there are multiple options.
@@ -712,9 +715,17 @@ def _corrupt_tokens(
         .otherwise(0)
     )
     candidates = (
-        candidates.filter(
-            pl.col(_TOKEN_LENGTH) == pl.col(_TOKEN_LENGTH).max().over(_ROW, _POS)
+        rows.filter(pl.col(_LEN) > 0)
+        .with_columns(pl.int_ranges(0, pl.col(_LEN)).alias(_POS))
+        .explode(_POS)
+        .join(token_lengths, how="cross")
+        .filter(pl.col(_POS) + pl.col(_TOKEN_LENGTH) <= pl.col(_LEN))
+        .with_columns(
+            pl.col(column_name).str.slice(pl.col(_POS), pl.col(_TOKEN_LENGTH)).alias(TOKEN)
         )
+        .join(errors, on=[TOKEN, _TOKEN_LENGTH], how="inner")
+        .filter(randomness.uniform(addl_key, _POS, _TOKEN_LENGTH) < token_probability)
+        .filter(pl.col(_TOKEN_LENGTH) == pl.col(_TOKEN_LENGTH).max().over(_ROW, _POS))
         .select(
             _ROW,
             _POS,
@@ -722,12 +733,15 @@ def _corrupt_tokens(
             pl.col(OPTIONS).list.get(corruption_index).alias(_REPLACEMENT),
         )
         .sort(_ROW, _POS)
+        .collect()
     )
-    corrupted = _resolve_left_to_right(candidates)
+    if candidates.is_empty():
+        return data[column_name]
+    corrupted = _resolve_left_to_right(candidates).lazy()
 
     # Rebuild only the strings that have at least one corruption.
     corrupted_rows = rows.join(corrupted.select(_ROW).unique(), on=_ROW, how="semi")
-    pieces = (
+    rebuilt = (
         _explode_characters(corrupted_rows, column_name)
         .join(corrupted, on=[_ROW, _POS], how="left", maintain_order="left")
         .with_columns(pl.col("__end").forward_fill().over(_ROW).alias("__covered_until"))
@@ -739,13 +753,13 @@ def _corrupt_tokens(
             .otherwise(pl.col(_CHAR))
             .alias(_CHAR)
         )
-    )
-    rebuilt = pieces.group_by(_ROW, maintain_order=True).agg(
-        pl.col(_CHAR).str.join("").alias("__rebuilt")
+        .group_by(_ROW)
+        .agg(pl.col(_CHAR).sort_by(_POS).str.join("").alias("__rebuilt"))
     )
     return (
         rows.join(rebuilt, on=_ROW, how="left", maintain_order="left")
         .select(pl.coalesce("__rebuilt", column_name).alias(column_name))
+        .collect()
         .to_series()
     )
 
@@ -761,29 +775,32 @@ def _resolve_left_to_right(candidates: pl.DataFrame) -> pl.DataFrame:
     earliest undecided candidate in each row is always decided, and overlap
     chains are short, so this converges in a few passes.
     """
-    kept = []
-    remaining = candidates
     previous_end = pl.col("__end").cum_max().shift(1).over(_ROW)
-    while not remaining.is_empty():
-        remaining = remaining.with_columns(
-            (previous_end.is_null() | (pl.col(_POS) >= previous_end)).alias("__keep")
-        )
-        newly_kept = remaining.filter("__keep")
-        kept.append(newly_kept.drop("__keep"))
-        kept_end = (
-            pl.when(pl.col("__keep"))
-            .then(pl.col("__end"))
-            .cum_max()
-            .forward_fill()
-            .shift(1)
-            .over(_ROW)
-        )
+    not_overlapped = (previous_end.is_null() | (pl.col(_POS) >= previous_end)).alias("__keep")
+    kept_end = (
+        pl.when(pl.col("__keep"))
+        .then(pl.col("__end"))
+        .cum_max()
+        .forward_fill()
+        .shift(1)
+        .over(_ROW)
+    )
+
+    kept = []
+    remaining = candidates.with_columns(not_overlapped)
+    # Usually no candidates overlap, and every candidate is kept in the first pass.
+    while not remaining["__keep"].all():
+        kept.append(remaining.filter("__keep"))
         remaining = (
-            remaining.with_columns(kept_end.alias("__kept_end"))
+            remaining.lazy()
+            .with_columns(kept_end.alias("__kept_end"))
             .filter(
                 ~pl.col("__keep")
                 & (pl.col("__kept_end").is_null() | (pl.col(_POS) >= pl.col("__kept_end")))
             )
             .drop("__keep", "__kept_end")
+            .with_columns(not_overlapped)
+            .collect()
         )
-    return pl.concat(kept).sort(_ROW, _POS)
+    kept.append(remaining)
+    return pl.concat(kept).drop("__keep").sort(_ROW, _POS)

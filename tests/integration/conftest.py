@@ -75,14 +75,17 @@ def split_sample_data_dir(tmpdir_factory):
             DatasetNames.TAXES_1040,
             DatasetNames.TAXES_W2_1099,
         ]:
-            hh_ids = (
-                data.filter(pl.col(COLUMNS.tax_year.name) == 2020)[COLUMNS.household_id.name]
-                .unique(maintain_order=True)
-            )
+            hh_ids = data.filter(pl.col(COLUMNS.tax_year.name) == 2020)[
+                COLUMNS.household_id.name
+            ].unique(maintain_order=True)
             hh1_ids = hh_ids.head(len(hh_ids) // 2)
             split_household_mask = pl.col(COLUMNS.household_id.name).is_in(hh1_ids.implode())
-            data.filter(split_household_mask).write_parquet(outdir / f"{dataset_name}_1.parquet")
-            data.filter(~split_household_mask).write_parquet(outdir / f"{dataset_name}_2.parquet")
+            data.filter(split_household_mask).write_parquet(
+                outdir / f"{dataset_name}_1.parquet"
+            )
+            data.filter(~split_household_mask).write_parquet(
+                outdir / f"{dataset_name}_2.parquet"
+            )
         else:
             split_idx = len(data) // 2
             data.head(split_idx).write_parquet(outdir / f"{dataset_name}_1.parquet")
@@ -99,7 +102,9 @@ def split_sample_data_dir_state_edit(tmpdir_factory, split_sample_data_dir):
     for dataset_name in ALL_DATASETS:
         outdir = Path(split_sample_data_dir_state_edit.mkdir(dataset_name))
         for shard in [1, 2]:
-            data_path = split_sample_data_dir / dataset_name / f"{dataset_name}_{shard}.parquet"
+            data_path = (
+                split_sample_data_dir / dataset_name / f"{dataset_name}_{shard}.parquet"
+            )
             data = pl.read_parquet(data_path)
             # We do not filter by state for SSA
             if dataset_name != DatasetNames.SSA:
@@ -246,7 +251,5 @@ def _get_common_datasets(
         suffix="__original",
     )
     check_noised = joined.select(value_columns)
-    check_original = joined.select(
-        pl.col(f"{c}__original").alias(c) for c in value_columns
-    )
+    check_original = joined.select(pl.col(f"{c}__original").alias(c) for c in value_columns)
     return check_noised, check_original

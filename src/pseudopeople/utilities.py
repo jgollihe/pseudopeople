@@ -85,7 +85,9 @@ def count_number_of_tokens_per_string(tokens: list[str], strings: pl.Series) -> 
     """
     strings = strings.cast(pl.String)
     unique_strings = strings.unique().drop_nulls()
-    counts = {s: sum(_count_occurrences(s, str(token)) for token in tokens) for s in unique_strings}
+    counts = {
+        s: sum(_count_occurrences(s, str(token)) for token in tokens) for s in unique_strings
+    }
     return strings.replace_strict(counts, default=0, return_dtype=pl.Int64)
 
 

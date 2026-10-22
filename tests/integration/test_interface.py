@@ -100,7 +100,9 @@ def test_generate_dataset_from_multiple_shards(
     for col_name in check_noised.columns:
         col = COLUMNS.get_column(col_name)
         if col.noise_types:
-            noise_level, to_compare = _get_column_noise_level(col, check_noised, check_original)
+            noise_level, to_compare = _get_column_noise_level(
+                col, check_noised, check_original
+            )
             _validate_column_noise_level(
                 dataset_name=dataset_name,
                 check_data=check_original.filter(to_compare),
@@ -386,6 +388,21 @@ def test_output_path_writes_shards(
     assert written.collect().equals(in_memory)
 
 
+@pytest.mark.parametrize("dataset_name", ALL_DATASET_NAMES)
+def test_n_workers_does_not_change_output(
+    dataset_name: str, config, split_sample_data_dir, mocker
+):
+    mocker.patch("pseudopeople.interface.validate_source_compatibility")
+    generation_function = partial(
+        DATASET_GENERATION_FUNCS[dataset_name],
+        seed=SEED,
+        year=None,
+        config=config,
+        source=split_sample_data_dir,
+    )
+    assert generation_function(n_workers=1).equals(generation_function(n_workers=2))
+
+
 ####################
 # HELPER FUNCTIONS #
 ####################
@@ -454,7 +471,9 @@ def _validate_column_noise_level(
                 ).mean()
 
             # This is accumulating not_noised over all noise types
-            not_noised = not_noised * (1 - avg_probability_any_token_noised * CELL_PROBABILITY)
+            not_noised = not_noised * (
+                1 - avg_probability_any_token_noised * CELL_PROBABILITY
+            )
 
     validator.fuzzy_assert_proportion(
         name=fuzzy_name,

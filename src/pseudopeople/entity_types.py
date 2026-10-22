@@ -98,9 +98,7 @@ class ColumnNoiseType(NoiseType):
     ) -> pl.Series:
         """Positions of the rows to noise: non-missing in every required column, then sampled."""
         required_columns = [column_name] + self.additional_column_getter(column_name)
-        eligible = pl.all_horizontal(
-            [pl.col(c).is_not_null() for c in required_columns]
-        )
+        eligible = pl.all_horizontal([pl.col(c).is_not_null() for c in required_columns])
         selected = eligible & (randomness.uniform(f"{self.name}_{column_name}") < noise_level)
         return data.select(pl.arg_where(selected)).to_series()
 

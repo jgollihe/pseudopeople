@@ -42,7 +42,9 @@ def _replicate(table: pa.Table, replicate: int) -> pa.Table:
 
 def build(out_dir: Path, replicates: int, shards: int, datasets: list[str] | None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "CHANGELOG.rst").write_text("**1.4.2 - 01/01/2024**\n\n - Synthetic benchmark data\n")
+    (out_dir / "CHANGELOG.rst").write_text(
+        "**1.4.2 - 01/01/2024**\n\n - Synthetic benchmark data\n"
+    )
     dataset_dirs = sorted(p for p in SAMPLE_ROOT.iterdir() if p.is_dir())
     for dataset_dir in dataset_dirs:
         if datasets and dataset_dir.name not in datasets:

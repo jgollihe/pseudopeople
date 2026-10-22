@@ -2,7 +2,7 @@ import os
 import warnings
 from functools import cache
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Tuple, Union
 
 import numpy as np
 import polars as pl
@@ -13,9 +13,7 @@ from loguru import logger
 
 
 def pytest_addoption(parser):
-    parser.addoption(
-        "--runslow", action="store_true", default=False, help="run slow tests"
-    )
+    parser.addoption("--runslow", action="store_true", default=False, help="run slow tests")
     parser.addoption(
         "--limit",
         action="store",
@@ -151,12 +149,12 @@ class FuzzyChecker:
         else:
             target_lower_bound = target_upper_bound = target_proportion
 
-        assert (
-            observed_numerator <= observed_denominator
-        ), f"There cannot be more events ({observed_numerator}) than opportunities for events ({observed_denominator})"
-        assert (
-            target_upper_bound >= target_lower_bound
-        ), f"The lower bound of the V&V target ({target_lower_bound}) cannot be greater than the upper bound ({target_upper_bound})"
+        assert observed_numerator <= observed_denominator, (
+            f"There cannot be more events ({observed_numerator}) than opportunities for events ({observed_denominator})"
+        )
+        assert target_upper_bound >= target_lower_bound, (
+            f"The lower bound of the V&V target ({target_lower_bound}) cannot be greater than the upper bound ({target_upper_bound})"
+        )
 
         bug_issue_alpha, bug_issue_beta = bug_issue_beta_distribution_parameters
         bug_issue_distribution = scipy.stats.betabinom(

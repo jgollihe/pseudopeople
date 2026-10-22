@@ -41,9 +41,9 @@ CORRUPT_TOKENS_TEST_CASES = {
 
 
 def _errors_table(errors: dict[str, list[str]]) -> pl.DataFrame:
-    return pl.DataFrame(
-        {TOKEN: list(errors), OPTIONS: list(errors.values())}
-    ).with_columns(n_options=pl.col(OPTIONS).list.len().cast(pl.Int64))
+    return pl.DataFrame({TOKEN: list(errors), OPTIONS: list(errors.values())}).with_columns(
+        n_options=pl.col(OPTIONS).list.len().cast(pl.Int64)
+    )
 
 
 def _rows(n: int) -> pl.DataFrame:
@@ -173,7 +173,9 @@ def test_weighted_choice(fuzzy_checker: FuzzyChecker):
     choice_weights = [0.40, 0.35, 0.25]
     picks = (
         _rows(num_choices)
-        .select(RANDOMNESS0.weighted_choice("best_seattle_sports_team", options, choice_weights))
+        .select(
+            RANDOMNESS0.weighted_choice("best_seattle_sports_team", options, choice_weights)
+        )
         .to_series()
     )
 
@@ -192,9 +194,7 @@ def test_weighted_choice(fuzzy_checker: FuzzyChecker):
 def test_from_options(fuzzy_checker: FuzzyChecker):
     options = ["Supersonics", "Mariners", "Kraken"]
     num_choices = 50_000
-    picks = (
-        _rows(num_choices).select(RANDOMNESS0.from_options("teams", options)).to_series()
-    )
+    picks = _rows(num_choices).select(RANDOMNESS0.from_options("teams", options)).to_series()
     for option in options:
         fuzzy_checker.fuzzy_assert_proportion(
             name="test_from_options",

@@ -92,8 +92,10 @@ def validate_overrides(overrides: Dict, default_config: ConfigTree) -> None:
                 )
                 parameter_config_validator_map = {
                     NOISE_TYPES.choose_wrong_option.name: {
-                        Keys.CELL_PROBABILITY: lambda *args, **kwargs: _validate_choose_wrong_option_probability(
-                            *args, **kwargs, column=column
+                        Keys.CELL_PROBABILITY: lambda *args, **kwargs: (
+                            _validate_choose_wrong_option_probability(
+                                *args, **kwargs, column=column
+                            )
                         )
                     },
                 }.get(noise_type, DEFAULT_PARAMETER_CONFIG_VALIDATOR_MAP)

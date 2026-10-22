@@ -1,7 +1,8 @@
 """Time (and optionally profile) pseudopeople dataset generation.
 
 Usage:
-    uv run python benchmarks/run_benchmark.py SOURCE_DIR --dataset decennial_census [--profile out.prof]
+    uv run python benchmarks/run_benchmark.py SOURCE_DIR --dataset decennial_census \
+        [--n-workers N] [--output-path DIR] [--profile out.prof]
 """
 
 import argparse
@@ -11,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+import polars as pl
 import psutil
 
 import pseudopeople as psp
@@ -54,13 +56,15 @@ def main() -> None:
     parser.add_argument("--dataset", default="decennial_census", choices=GENERATORS)
     parser.add_argument("--year", type=int, default=None)
     parser.add_argument("--profile", type=Path, default=None)
-    parser.add_argument("--extra", nargs="*", default=[], help="key=value kwargs")
+    parser.add_argument("--n-workers", type=int, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
     args = parser.parse_args()
 
     kwargs = {"source": args.source, "year": args.year}
-    for item in args.extra:
-        key, value = item.split("=", 1)
-        kwargs[key] = value
+    if args.n_workers is not None:
+        kwargs["n_workers"] = args.n_workers
+    if args.output_path is not None:
+        kwargs["output_path"] = args.output_path
 
     generator = GENERATORS[args.dataset]
     profiler = cProfile.Profile() if args.profile else None
@@ -73,8 +77,13 @@ def main() -> None:
             profiler.disable()
         elapsed = time.perf_counter() - start
 
-    rows = len(result) if result is not None else "n/a (written to disk)"
-    print(f"{args.dataset}: {elapsed:.1f}s, peak RSS {memory.peak / 2**30:.2f} GiB, rows {rows}")
+    if isinstance(result, pl.LazyFrame):
+        rows = result.select(pl.len()).collect().item()
+    else:
+        rows = len(result)
+    print(
+        f"{args.dataset}: {elapsed:.1f}s, peak RSS {memory.peak / 2**30:.2f} GiB, rows {rows}"
+    )
     if profiler:
         profiler.dump_stats(args.profile)
         pstats.Stats(profiler).sort_stats("cumulative").print_stats(35)
