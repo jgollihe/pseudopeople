@@ -338,7 +338,7 @@ def validate_noise_level_proportions(
                 ][row["noise_type"]][Keys.CELL_PROBABILITY]
                 entity_type = Keys.COLUMN_NOISE
             max_noise_level = row["proportion"]
-            if config_noise_level > max_noise_level:
+            if max_noise_level is not None and config_noise_level > max_noise_level:
                 logger.warning(
                     f"The configured '{row['noise_type']}' noise level for {entity_type} '{row['column']}' is {config_noise_level}, "
                     f"which is higher than the maximum possible value based on the provided data for '{row['dataset']}'. "

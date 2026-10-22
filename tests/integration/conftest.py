@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 import pytest
 
 from pseudopeople.configuration import Keys, get_configuration
@@ -8,6 +8,7 @@ from pseudopeople.configuration.entities import NO_NOISE
 from pseudopeople.constants import paths
 from pseudopeople.constants.metadata import DatasetNames
 from pseudopeople.interface import (
+    _clean_input_data,
     _coerce_dtypes,
     _reformat_dates_for_noising,
     generate_american_community_survey,
@@ -18,6 +19,7 @@ from pseudopeople.interface import (
     generate_taxes_w2_and_1099,
     generate_women_infants_and_children,
 )
+from pseudopeople.loader import load_standard_dataset
 from pseudopeople.noise_entities import NOISE_TYPES
 from pseudopeople.schema_entities import COLUMNS, DATASETS
 
@@ -43,75 +45,75 @@ IDX_COLS = {
         COLUMNS.tax_year.name,
     ],
 }
+ALL_DATASETS = [
+    DatasetNames.CENSUS,
+    DatasetNames.ACS,
+    DatasetNames.CPS,
+    DatasetNames.SSA,
+    DatasetNames.TAXES_W2_1099,
+    DatasetNames.WIC,
+    DatasetNames.TAXES_1040,
+]
+
+
+def _read_sample_parquet(dataset_name: str) -> pl.DataFrame:
+    return load_standard_dataset(
+        paths.SAMPLE_DATA_ROOT / dataset_name / f"{dataset_name}.parquet", []
+    )
 
 
 @pytest.fixture(scope="session")
 def split_sample_data_dir(tmpdir_factory):
-    datasets = [
-        DatasetNames.CENSUS,
-        DatasetNames.ACS,
-        DatasetNames.CPS,
-        DatasetNames.SSA,
-        DatasetNames.TAXES_W2_1099,
-        DatasetNames.WIC,
-        DatasetNames.TAXES_1040,
-    ]
     split_sample_data_dir = tmpdir_factory.mktemp("split_sample_data")
-    for dataset_name in datasets:
-        data_path = paths.SAMPLE_DATA_ROOT / dataset_name / f"{dataset_name}.parquet"
-        data = pd.read_parquet(data_path)
+    for dataset_name in ALL_DATASETS:
+        data = _read_sample_parquet(dataset_name)
         # Split the sample dataset into two and save in tmpdir_factory
         # We are spliting on household_id as a solution for how to keep households together
         # for the tax 1040 dataset.
-        outdir = split_sample_data_dir.mkdir(dataset_name)
+        outdir = Path(split_sample_data_dir.mkdir(dataset_name))
         if dataset_name in [
             DatasetNames.TAXES_1040,
             DatasetNames.TAXES_W2_1099,
         ]:
-            hh_ids = data.loc[
-                data[COLUMNS.tax_year.name] == 2020, COLUMNS.household_id.name
-            ].unique()
-            hh1_ids = hh_ids[: int(len(hh_ids) / 2)]
-            split_household_mask = data[COLUMNS.household_id.name].isin(hh1_ids)
-            data[split_household_mask].to_parquet(outdir / f"{dataset_name}_1.parquet")
-            data[~split_household_mask].to_parquet(outdir / f"{dataset_name}_2.parquet")
+            hh_ids = (
+                data.filter(pl.col(COLUMNS.tax_year.name) == 2020)[COLUMNS.household_id.name]
+                .unique(maintain_order=True)
+            )
+            hh1_ids = hh_ids.head(len(hh_ids) // 2)
+            split_household_mask = pl.col(COLUMNS.household_id.name).is_in(hh1_ids.implode())
+            data.filter(split_household_mask).write_parquet(outdir / f"{dataset_name}_1.parquet")
+            data.filter(~split_household_mask).write_parquet(outdir / f"{dataset_name}_2.parquet")
         else:
-            split_idx = int(len(data) / 2)
-            data[:split_idx].to_parquet(outdir / f"{dataset_name}_1.parquet")
-            data[split_idx:].to_parquet(outdir / f"{dataset_name}_2.parquet")
+            split_idx = len(data) // 2
+            data.head(split_idx).write_parquet(outdir / f"{dataset_name}_1.parquet")
+            data.slice(split_idx).write_parquet(outdir / f"{dataset_name}_2.parquet")
 
     return Path(split_sample_data_dir)
 
 
 @pytest.fixture(scope="session")
 def split_sample_data_dir_state_edit(tmpdir_factory, split_sample_data_dir):
-    # This replace our old tmpdir fixture we were using because this more accurately
-    # represents our sample data directory structure with a subdirectory for each
-    # dataset and storing all files in the fixture.
-    datasets = [
-        DatasetNames.CENSUS,
-        DatasetNames.ACS,
-        DatasetNames.CPS,
-        DatasetNames.SSA,
-        DatasetNames.TAXES_W2_1099,
-        DatasetNames.WIC,
-        DatasetNames.TAXES_1040,
-    ]
+    # This more accurately represents our sample data directory structure with
+    # a subdirectory for each dataset and storing all files in the fixture.
     split_sample_data_dir_state_edit = tmpdir_factory.mktemp("split_sample_data_state_edit")
-    for dataset_name in datasets:
-        outdir = split_sample_data_dir_state_edit.mkdir(dataset_name)
-        data_paths = [
-            split_sample_data_dir / dataset_name / f"{dataset_name}_1.parquet",
-            split_sample_data_dir / dataset_name / f"{dataset_name}_2.parquet",
-        ]
-        for data_path in data_paths:
-            data = pd.read_parquet(data_path).copy()
+    for dataset_name in ALL_DATASETS:
+        outdir = Path(split_sample_data_dir_state_edit.mkdir(dataset_name))
+        for shard in [1, 2]:
+            data_path = split_sample_data_dir / dataset_name / f"{dataset_name}_{shard}.parquet"
+            data = pl.read_parquet(data_path)
             # We do not filter by state for SSA
             if dataset_name != DatasetNames.SSA:
                 # Add a state so we can filter for integration tests
-                state_column = [column for column in data.columns if "state" in column]
-                data.loc[data.reset_index().index % 2 == 0, state_column] = STATE
-                data.to_parquet(outdir / data_path.name)
+                state_columns = [column for column in data.columns if "state" in column]
+                is_even_row = pl.int_range(pl.len()) % 2 == 0
+                data = data.with_columns(
+                    pl.when(is_even_row)
+                    .then(pl.lit(STATE))
+                    .otherwise(pl.col(c).cast(pl.String))
+                    .alias(c)
+                    for c in state_columns
+                )
+                data.write_parquet(outdir / data_path.name)
 
     return Path(split_sample_data_dir_state_edit)
 
@@ -203,80 +205,48 @@ def noised_sample_data_taxes_1040(config):
     return generate_taxes_1040(seed=SEED, year=None, config=config)
 
 
-# Raw sample datasets with half from a specific state, for state filtering
-@pytest.fixture(scope="module")
-def sample_data_decennial_census_state_edit():
-    data = _load_sample_data(DATASETS.census.name)
-    # Set half of the entries to the state we'll filter on
-    data.loc[data.reset_index().index % 2 == 0, DATASETS.census.state_column_name] = STATE
-    return data
-
-
-@pytest.fixture(scope="module")
-def sample_data_american_community_survey_state_edit():
-    data = _load_sample_data(DATASETS.acs.name)
-    # Set half of the entries to the state we'll filter on
-    data.loc[data.reset_index().index % 2 == 0, DATASETS.acs.state_column_name] = STATE
-    return data
-
-
-@pytest.fixture(scope="module")
-def sample_data_current_population_survey_state_edit():
-    data = _load_sample_data(DATASETS.cps.name)
-    # Set half of the entries to the state we'll filter on
-    data.loc[data.reset_index().index % 2 == 0, DATASETS.cps.state_column_name] = STATE
-    return data
-
-
-@pytest.fixture(scope="module")
-def sample_data_women_infants_and_children_state_edit():
-    data = _load_sample_data(DATASETS.wic.name)
-    # Set half of the entries to the state we'll filter on
-    data.loc[data.reset_index().index % 2 == 0, DATASETS.wic.state_column_name] = STATE
-    return data
-
-
-@pytest.fixture(scope="module")
-def sample_data_taxes_w2_and_1099_state_edit():
-    data = _load_sample_data(DATASETS.tax_w2_1099.name)
-    # Set half of the entries to the state we'll filter on
-    data.loc[
-        data.reset_index().index % 2 == 0, DATASETS.tax_w2_1099.state_column_name
-    ] = STATE
-    return data
-
-
 ####################
 # HELPER FUNCTIONS #
 ####################
 
 
-def _load_sample_data(dataset, request):
+def _load_sample_data(dataset, request) -> pl.DataFrame:
     if dataset == DatasetNames.TAXES_1040:
         # We need to get formatted 1040 data that is not noised to get the expected columns
-        data = request.getfixturevalue("formatted_1040_sample_data")
-    else:
-        data_path = paths.SAMPLE_DATA_ROOT / dataset / f"{dataset}.parquet"
-        data = pd.read_parquet(data_path)
-
-    return data
+        return request.getfixturevalue("formatted_1040_sample_data")
+    return _read_sample_parquet(dataset)
 
 
-def _get_common_datasets(dataset_name, data, noised_data):
-    """Use unique columns to determine shared non-NA rows between noised and
-    unnoised data. Note that we cannot use the original index because that
-    gets reset after noising, i.e. the unique columns must NOT be noised.
+def _format_like_output(data: pl.DataFrame, dataset_name: str) -> pl.DataFrame:
+    """Unnoised data formatted the same way as pseudopeople output."""
+    dataset = DATASETS.get_dataset(dataset_name)
+    formatted = _clean_input_data(_reformat_dates_for_noising(data, dataset), dataset)
+    return _coerce_dtypes(formatted, dataset).select(c.name for c in dataset.columns)
+
+
+def _get_common_datasets(
+    dataset_name, data, noised_data
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Use unique columns to determine shared rows between noised and unnoised data.
+    The unique columns must NOT be noised. Returns (noised, original), aligned row
+    by row and with all columns cast to strings for comparison.
     """
     idx_cols = IDX_COLS.get(dataset_name)
-    dataset = DATASETS.get_dataset(dataset_name)
-    check_original = _coerce_dtypes(
-        _reformat_dates_for_noising(data, dataset), dataset
-    ).set_index(idx_cols)
-    check_noised = noised_data.set_index(idx_cols)
+    check_original = _format_like_output(data, dataset_name)
     # Ensure the idx_cols are unique
-    assert check_original.index.duplicated().sum() == 0
-    assert check_noised.index.duplicated().sum() == 0
-    shared_idx = pd.Index(set(check_original.index).intersection(set(check_noised.index)))
-    check_original = check_original.loc[shared_idx]
-    check_noised = check_noised.loc[shared_idx]
-    return check_noised, check_original, shared_idx
+    assert not check_original.select(pl.struct(idx_cols).is_duplicated().any()).item()
+    assert not noised_data.select(pl.struct(idx_cols).is_duplicated().any()).item()
+
+    value_columns = [c for c in noised_data.columns if c not in idx_cols]
+    as_strings = [pl.col(c).cast(pl.String) for c in value_columns]
+    joined = noised_data.select(*idx_cols, *as_strings).join(
+        check_original.select(*idx_cols, *as_strings),
+        on=idx_cols,
+        how="inner",
+        suffix="__original",
+    )
+    check_noised = joined.select(value_columns)
+    check_original = joined.select(
+        pl.col(f"{c}__original").alias(c) for c in value_columns
+    )
+    return check_noised, check_original

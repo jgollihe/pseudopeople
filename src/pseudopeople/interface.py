@@ -227,18 +227,14 @@ def _coerce_dtypes(
     )
 
 
-_STRFTIME_FORMATS = {
-    DATEFORMATS.YYYYMMDD: "%Y%m%d",
-    DATEFORMATS.MM_DD_YYYY: "%m/%d/%Y",
-    DATEFORMATS.MMDDYYYY: "%m%d%Y",
-}
-
-
 def _reformat_dates_for_noising(data: pl.DataFrame, dataset: Dataset) -> pl.DataFrame:
     """Formats date columns so they can be noised as strings."""
-    if dataset.date_format not in _STRFTIME_FORMATS:
+    if dataset.date_format not in (
+        DATEFORMATS.YYYYMMDD,
+        DATEFORMATS.MM_DD_YYYY,
+        DATEFORMATS.MMDDYYYY,
+    ):
         raise ValueError(f"Invalid date format in {dataset.name}.")
-    date_format = _STRFTIME_FORMATS[dataset.date_format]
     date_columns = []
     for date_column in [COLUMNS.dob.name, COLUMNS.ssa_event_date.name]:
         # Format both the actual column, and the shadow version that will be used
@@ -246,7 +242,7 @@ def _reformat_dates_for_noising(data: pl.DataFrame, dataset: Dataset) -> pl.Data
         for column in [date_column, COPY_HOUSEHOLD_MEMBER_COLS.get(date_column)]:
             if column in data.columns and data.schema[column].is_temporal():
                 date_columns.append(column)
-    return data.with_columns(pl.col(date_columns).dt.strftime(date_format))
+    return data.with_columns(pl.col(date_columns).dt.strftime(dataset.date_format))
 
 
 def _extract_columns(columns_to_keep, noised_dataset):
