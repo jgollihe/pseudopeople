@@ -198,9 +198,8 @@ texinfo_documents = [
 # Other docs we can link to
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3.8", None),
+    "polars": ("https://docs.pola.rs/api/python/stable/", None),
     "pandas": ("https://pandas.pydata.org/pandas-docs/stable/", None),
-    "dask": ("https://docs.dask.org/en/stable/", None),
-    "distributed": ("https://distributed.dask.org/en/stable/", None),
     "tables": ("https://www.pytables.org/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
     "networkx": ("https://networkx.org/documentation/stable/", None),

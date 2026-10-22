@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Tuple, Union
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 import scipy.stats
 from _pytest.logging import LogCaptureFixture
@@ -13,6 +13,9 @@ from loguru import logger
 
 
 def pytest_addoption(parser):
+    parser.addoption(
+        "--runslow", action="store_true", default=False, help="run slow tests"
+    )
     parser.addoption(
         "--limit",
         action="store",
@@ -311,11 +314,10 @@ class FuzzyChecker:
         Can be useful to get more information about warnings, or to prioritize
         areas to be more thorough in manual V&V.
         """
-        output = pd.DataFrame(self.proportion_test_diagnostics)
-        output.to_csv(
-            Path(os.path.dirname(__file__))
-            / "v_and_v_output/proportion_test_diagnostics.csv",
-            index=False,
+        output_dir = Path(os.path.dirname(__file__)) / "v_and_v_output"
+        output_dir.mkdir(exist_ok=True)
+        pl.DataFrame(self.proportion_test_diagnostics, infer_schema_length=None).write_csv(
+            output_dir / "proportion_test_diagnostics.csv"
         )
 
 

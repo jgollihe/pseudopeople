@@ -38,7 +38,6 @@ class __NoiseTypes(NamedTuple):
     leave_blank: ColumnNoiseType = ColumnNoiseType(
         "leave_blank",
         noise_functions.leave_blanks,
-        output_dtype_getter=output_dtype_getters.output_dtype_getter_leave_blank,
     )
     choose_wrong_option: ColumnNoiseType = ColumnNoiseType(
         "choose_wrong_option",

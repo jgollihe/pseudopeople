@@ -1,13 +1,13 @@
 from functools import cache
 
-import numpy as np
-import pandas as pd
+import polars as pl
 
 from pseudopeople.constants import paths
 from pseudopeople.constants.noise_type_metadata import COPY_HOUSEHOLD_MEMBER_COLS
+from pseudopeople.utilities import OPTIONS, TOKEN
 
 
-def scale_choose_wrong_option(data: pd.DataFrame, column_name: str) -> float:
+def scale_choose_wrong_option(data: pl.DataFrame, column_name: str) -> float:
     """
     Function to scale noising for choose_wrong_option to adjust for the possibility
     of noising with the original values.
@@ -23,26 +23,29 @@ def scale_choose_wrong_option(data: pd.DataFrame, column_name: str) -> float:
     return noise_scaling_value
 
 
-def scale_nicknames(data: pd.DataFrame, column_name: str) -> float:
+def scale_nicknames(data: pl.DataFrame, column_name: str) -> float:
     # Constant calculated by number of names with nicknames / number of names used in PRL name mapping
     nicknames = load_nicknames_data()
-    proportion_have_nickname = (
-        data[column_name].isin(nicknames.index).sum() / data[column_name].notna().sum()
-    )
-    if proportion_have_nickname == 0.0:
+    have_nickname, not_null = data.select(
+        pl.col(column_name).is_in(nicknames[TOKEN].implode()).sum().alias("have_nickname"),
+        pl.col(column_name).is_not_null().sum().alias("not_null"),
+    ).row(0)
+    if have_nickname == 0:
         return 0.0
-    return 1 / proportion_have_nickname
+    return not_null / have_nickname
 
 
-def scale_copy_from_household_member(data: pd.DataFrame, column_name: str) -> float:
-    original_column = data[column_name]
-    copy_column = data[COPY_HOUSEHOLD_MEMBER_COLS[column_name]]
-    original_column_not_missing = (original_column != "") & (original_column.notna())
-    eligible = (copy_column != "") & (copy_column.notna()) & original_column_not_missing
-    proportion_eligible = eligible.sum() / original_column_not_missing.sum()
-    if proportion_eligible == 0.0:
+def scale_copy_from_household_member(data: pl.DataFrame, column_name: str) -> float:
+    original = pl.col(column_name)
+    copy = pl.col(COPY_HOUSEHOLD_MEMBER_COLS[column_name])
+    original_not_missing = original.is_not_null() & (original != "")
+    eligible = copy.is_not_null() & (copy != "") & original_not_missing
+    n_eligible, n_original = data.select(
+        eligible.sum().alias("eligible"), original_not_missing.sum().alias("original")
+    ).row(0)
+    if n_eligible == 0:
         return 0.0
-    return 1 / proportion_eligible
+    return n_original / n_eligible
 
 
 ####################
@@ -51,15 +54,23 @@ def scale_copy_from_household_member(data: pd.DataFrame, column_name: str) -> fl
 
 
 @cache
-def load_nicknames_data():
-    # Load and format nicknames dataset
-    nicknames = pd.read_csv(paths.NICKNAMES_DATA)
-    nicknames = nicknames.apply(lambda x: x.astype(str).str.title()).set_index("name")
-    nicknames = nicknames.replace("Nan", np.nan)
-    return nicknames
+def load_nicknames_data() -> pl.DataFrame:
+    """One row per nickname-eligible name with the list of its nicknames (title case)."""
+    nicknames = pl.read_csv(paths.NICKNAMES_DATA, infer_schema=False)
+    nickname_columns = [c for c in nicknames.columns if c != "name"]
+    return (
+        nicknames.select(
+            pl.col("name").str.to_titlecase().alias(TOKEN),
+            pl.concat_list(pl.col(nickname_columns).str.to_titlecase())
+            .list.drop_nulls()
+            .alias(OPTIONS),
+        )
+        .with_columns(n_options=pl.col(OPTIONS).list.len().cast(pl.Int64))
+        .filter(pl.col("n_options") > 0)
+    )
 
 
-def get_options_for_column(column_name: str) -> pd.Series:
+def get_options_for_column(column_name: str) -> pl.Series:
     """
     For a column that has a set list of options, returns that set of options as
     a Series.
@@ -73,10 +84,9 @@ def get_options_for_column(column_name: str) -> pd.Series:
         COLUMNS.mailing_state.name: COLUMNS.state.name,
     }.get(column_name, column_name)
 
-    selection_options = load_incorrect_select_options()
-    return selection_options.loc[selection_options[selection_type].notna(), selection_type]
+    return load_incorrect_select_options()[selection_type].drop_nulls()
 
 
 @cache
-def load_incorrect_select_options() -> pd.DataFrame:
-    return pd.read_csv(paths.INCORRECT_SELECT_NOISE_OPTIONS_DATA)
+def load_incorrect_select_options() -> pl.DataFrame:
+    return pl.read_csv(paths.INCORRECT_SELECT_NOISE_OPTIONS_DATA, infer_schema=False)

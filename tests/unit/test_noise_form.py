@@ -2,8 +2,7 @@ import random
 from string import ascii_lowercase
 from typing import NamedTuple
 
-import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 from vivarium.config_tree import ConfigTree
 
@@ -20,6 +19,7 @@ from pseudopeople.interface import (
 )
 from pseudopeople.noise import noise_dataset
 from pseudopeople.noise_entities import NOISE_TYPES
+from pseudopeople.randomness import ROW_ID
 from pseudopeople.schema_entities import DATASETS
 from tests.conftest import FuzzyChecker
 
@@ -29,7 +29,7 @@ def dummy_data():
     """Create a two-column dummy dataset"""
     random.seed(0)
     num_rows = 1_000_000
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             "event_type": [str(x) for x in range(num_rows)],
             "words": [
@@ -46,7 +46,7 @@ def noise_order_data(dummy_data):
     which noise functions are called, and its mocks hold copies of the data they are
     given, so the full dataset uses several GB of memory without testing anything more.
     """
-    return dummy_data.iloc[:1_000].copy()
+    return dummy_data.head(1_000).with_row_index(ROW_ID)
 
 
 def get_dummy_config_noise_numbers(dataset):
@@ -128,12 +128,14 @@ def test_noise_order(mocker, noise_order_data, dataset):
     # Mock the noise_functions functions so that they are not actually called and
     # return the original one-column dataframe (so that it doesn't become a mock
     # object itself after the first mocked function is applied.)
-    mocker.patch(
-        "pseudopeople.entity_types.get_index_to_noise", return_value=noise_order_data.index
+    mocker.patch.object(
+        ColumnNoiseType,
+        "select_rows",
+        return_value=pl.int_range(len(noise_order_data), dtype=pl.UInt32, eager=True),
     )
     for field in NOISE_TYPES._fields:
         mock_return = (
-            noise_order_data[["event_type"]]
+            noise_order_data
             if field
             in [
                 NOISE_TYPES.do_not_respond.name,
@@ -228,10 +230,9 @@ def test_columns_noised(dummy_data):
             },
         },
     )
-    noised_data = dummy_data.copy()
-    noised_data = noise_dataset(DATASETS.census, noised_data, config, 0)
+    noised_data = noise_dataset(DATASETS.census, dummy_data, config, 0)
 
-    assert (dummy_data["event_type"] != noised_data["event_type"]).any()
+    assert dummy_data["event_type"].ne_missing(noised_data["event_type"]).any()
     assert (dummy_data["words"] == noised_data["words"]).all()
 
 
@@ -283,21 +284,23 @@ def test_two_noise_functions_are_independent(mocker, fuzzy_checker: FuzzyChecker
     class MockNoiseTypes(NamedTuple):
         ALPHA: ColumnNoiseType = ColumnNoiseType(
             "alpha",
-            lambda data, *_: data.squeeze().str.cat(pd.Series("abc", index=data.index)),
+            lambda data, _config, _randomness, _dataset, column: data[column] + "abc",
         )
         BETA: ColumnNoiseType = ColumnNoiseType(
             "beta",
-            lambda data, *_: data.squeeze().str.cat(pd.Series("123", index=data.index)),
+            lambda data, _config, _randomness, _dataset, column: data[column] + "123",
         )
         leave_blank = ColumnNoiseType(
             "leave_blank",
-            lambda data, *_: pd.Series(np.nan, index=data.index),
+            lambda data, _config, _randomness, _dataset, column: pl.repeat(
+                None, data.height, dtype=pl.String, eager=True
+            ),
         )
 
     mock_noise_types = MockNoiseTypes()
 
     mocker.patch("pseudopeople.noise.NOISE_TYPES", mock_noise_types)
-    dummy_dataset = pd.DataFrame(
+    dummy_dataset = pl.DataFrame(
         {
             "fake_column_one": ["cat", "dog", "bird", "bunny", "duck"] * 20_000,
             "fake_column_two": ["shoe", "pants", "shirt", "hat", "sunglasses"] * 20_000,
