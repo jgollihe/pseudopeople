@@ -38,6 +38,7 @@ dependencies = [
     "tqdm>=4.66",
     "packaging>=23",
     "vivarium-config-tree>=5.2.1,<6.0.0",
+    "ipykernel>=7.4.0",
 ]
 
 [project.optional-dependencies]
