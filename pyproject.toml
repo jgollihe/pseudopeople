@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "pseudopeople"
 dynamic = ["version"]
 description = "pseudopeople generates realistic simulated data about a fictional United States population, designed for use in testing entity resolution (record linkage) methods or other data science algorithms at scale."
-readme = "README.rst"
+readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 authors = [{ name = "The pseudopeople developers", email = "vivarium.dev@gmail.com" }]
@@ -84,7 +84,7 @@ template = "__version__ = \"{version}\"\n"
 packages = ["src/pseudopeople"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/pseudopeople", "tests", "docs", "CHANGELOG.rst", "README.rst", "LICENSE"]
+include = ["src/pseudopeople", "tests", "docs", "CHANGELOG.rst", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 xfail_strict = true
