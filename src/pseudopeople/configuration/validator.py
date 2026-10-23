@@ -1,7 +1,9 @@
+import math
+from datetime import datetime
+from functools import cache
 from typing import Callable, Dict, List, Tuple, Union
 
-import numpy as np
-import pandas as pd
+import polars as pl
 from loguru import logger
 from vivarium.config_tree import ConfigTree, ConfigurationKeyError
 
@@ -90,8 +92,10 @@ def validate_overrides(overrides: Dict, default_config: ConfigTree) -> None:
                 )
                 parameter_config_validator_map = {
                     NOISE_TYPES.choose_wrong_option.name: {
-                        Keys.CELL_PROBABILITY: lambda *args, **kwargs: _validate_choose_wrong_option_probability(
-                            *args, **kwargs, column=column
+                        Keys.CELL_PROBABILITY: lambda *args, **kwargs: (
+                            _validate_choose_wrong_option_probability(
+                                *args, **kwargs, column=column
+                            )
                         )
                     },
                 }.get(noise_type, DEFAULT_PARAMETER_CONFIG_VALIDATOR_MAP)
@@ -198,7 +202,7 @@ def _validate_possible_age_differences(
                     + f"'{parameter}' probabilities must be between 0 and 1 (inclusive). "
                     f"Provided {value} in {list(noise_type_config.values())}."
                 )
-        if not np.isclose(sum(noise_type_config.values()), 1.0):
+        if not math.isclose(sum(noise_type_config.values()), 1.0, rel_tol=1e-5, abs_tol=1e-8):
             raise ConfigurationError(
                 base_error_message + f"'{parameter}' probabilities must sum to 1. "
                 f"Provided values sum to {sum(noise_type_config.values())}."
@@ -257,6 +261,14 @@ def _validate_choose_wrong_option_probability(
         )
 
 
+@cache
+def _load_metadata_proportions() -> pl.DataFrame:
+    return pl.read_csv(
+        paths.METADATA_PROPORTIONS,
+        schema_overrides={"year": pl.Int64, "column": pl.String, "proportion": pl.Float64},
+    )
+
+
 def validate_noise_level_proportions(
     configuration_tree: ConfigTree, dataset: Dataset, user_filters: List[Tuple]
 ) -> None:
@@ -266,10 +278,9 @@ def validate_noise_level_proportions(
     then throw a warning to the user and adjust the noise level to the allowable proportion.
     """
     # TODO: update file and filepath
-    metadata_proportions = pd.read_csv(paths.METADATA_PROPORTIONS)
-    dataset_proportions = metadata_proportions.loc[
-        metadata_proportions["dataset"] == dataset.name
-    ]
+    dataset_proportions = _load_metadata_proportions().filter(
+        pl.col("dataset") == dataset.name
+    )
     # Set default values for state and year
     if dataset.name == metadata.DatasetNames.SSA:
         state = "USA"
@@ -278,8 +289,8 @@ def validate_noise_level_proportions(
         # with a future release/our next data upload. We do not have a way to get state in a
         # case where the user is not filtering on state because they either are using the sample
         # data or state (Rhode Island) data.
-        if len(dataset_proportions["state"].unique()) == 1:
-            state = dataset_proportions["state"].unique()[0]
+        if dataset_proportions["state"].n_unique() == 1:
+            state = dataset_proportions["state"][0]
         else:
             state = "USA"
     year = metadata.YEAR_AGGREGATION_VALUE
@@ -290,30 +301,28 @@ def validate_noise_level_proportions(
             break
     for i in range(len(user_filters)):
         if user_filters[i][0] == dataset.date_column_name:
-            if isinstance(user_filters[i][2], pd.Timestamp):
+            if isinstance(user_filters[i][2], datetime):
                 year = user_filters[i][2].year
             else:
                 year = user_filters[i][2]
             break
 
     # Subset the metadata proportions to the state and year that the user is querying
-    dataset_noise_proportions = dataset_proportions.loc[
-        (dataset_proportions["state"] == state) & (dataset_proportions["year"] == year)
-    ]
+    dataset_noise_proportions = dataset_proportions.filter(
+        (pl.col("state") == state) & (pl.col("year") == year)
+    )
 
     # If there is no data for a queried dataset, we want the user's to hit the correct error that there
     # is no data available so we do not throw an error here.
-    if not dataset_noise_proportions.empty:
+    if not dataset_noise_proportions.is_empty():
         # Go through each row in the queried dataset noise proportions to validate the noise levels
-        for i in range(len(dataset_noise_proportions)):
-            row = dataset_noise_proportions.iloc[i].copy()
-            if row["column"] not in [col.name for col in dataset.columns] and not pd.isnull(
-                row["column"]
+        for row in dataset_noise_proportions.iter_rows(named=True):
+            if row["column"] not in [col.name for col in dataset.columns] and (
+                row["column"] is not None
             ):
                 continue
             # Get the maximum noise level and the configured noise level
-            if pd.isnull(row["column"]):
-                # Note: Using pd.isnull here and above because np.isnan does not work on strings
+            if row["column"] is None:
                 if NOISE_TYPES.duplicate_with_guardian in dataset.row_noise_types:
                     # Config level for guardian duplication group
                     config_noise_level = configuration_tree[row["dataset"]][Keys.ROW_NOISE][
@@ -331,7 +340,7 @@ def validate_noise_level_proportions(
                 ][row["noise_type"]][Keys.CELL_PROBABILITY]
                 entity_type = Keys.COLUMN_NOISE
             max_noise_level = row["proportion"]
-            if config_noise_level > max_noise_level:
+            if max_noise_level is not None and config_noise_level > max_noise_level:
                 logger.warning(
                     f"The configured '{row['noise_type']}' noise level for {entity_type} '{row['column']}' is {config_noise_level}, "
                     f"which is higher than the maximum possible value based on the provided data for '{row['dataset']}'. "

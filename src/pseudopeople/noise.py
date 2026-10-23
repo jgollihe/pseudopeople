@@ -5,33 +5,32 @@
 
 A function that will noise data based on a user's configuration.
 
-This function is the core of Pseudopeople, which takes in a pd.DataFrame or dataset
-data and will add noise to both rows and columns based on the configured values
-provided by the user.  First, the Dataset will be noised for missing data and have
-rows in each columns changed to null values.  Then, the dataset data will be noised
-by column and row for each type of additional noise type.
+This function is the core of Pseudopeople, which takes in a Polars DataFrame of
+dataset data and will add noise to both rows and columns based on the
+configured values provided by the user. Missing values are always nulls, so
+whether a cell is eligible for noise is read directly from the data.
 """
 
 from typing import Any
 
-import pandas as pd
+import polars as pl
 from tqdm import tqdm
 from vivarium.config_tree import ConfigTree
 
 from pseudopeople.configuration import Keys
 from pseudopeople.entity_types import ColumnNoiseType, RowNoiseType
 from pseudopeople.noise_entities import NOISE_TYPES
-from pseudopeople.schema_entities import COLUMNS, Dataset
-from pseudopeople.utilities import get_randomness_stream
+from pseudopeople.randomness import ROW_ID, Randomness
+from pseudopeople.schema_entities import Dataset
 
 
 def noise_dataset(
     dataset: Dataset,
-    dataset_data: pd.DataFrame,
+    dataset_data: pl.DataFrame,
     configuration: ConfigTree,
     seed: Any,
     progress_bar: bool = True,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """
     Adds noise to the input dataset data. Noise functions are executed in the order
     defined by :py:const: `.NOISE_TYPES`. Row noise functions are applied to the
@@ -42,7 +41,8 @@ def noise_dataset(
     :param dataset:
         Dataset needing to be noised
     :param dataset_data:
-        Simulated population data which needs to be noised.
+        Simulated population data which needs to be noised. Gets a row id column
+        if it does not already have one.
     :param configuration:
         Object to configure noise levels
     :param seed:
@@ -50,13 +50,11 @@ def noise_dataset(
     :return:
         Noised dataset data
     """
-    randomness = get_randomness_stream(dataset.name, seed, dataset_data.index)
+    randomness = Randomness(f"{dataset.name}_{seed}")
+    if ROW_ID not in dataset_data.columns:
+        dataset_data = dataset_data.with_row_index(ROW_ID)
 
     noise_configuration = configuration[dataset.name]
-
-    # We only need to do this once, because noise does not introduce missingness,
-    # except for the leave_blank kind which is special-cased below
-    missingness = (dataset_data == "") | (dataset_data.isna())
 
     if progress_bar:
         noise_type_iterator = tqdm(
@@ -71,23 +69,12 @@ def noise_dataset(
                 Keys.ROW_NOISE in noise_configuration
                 and noise_type.name in noise_configuration.row_noise
             ):
-                original_index = dataset_data.index
-                # Apply row noise
                 dataset_data = noise_type(
                     dataset.name,
                     dataset_data,
                     noise_configuration[Keys.ROW_NOISE][noise_type.name],
                     randomness,
                 )
-                missingness = missingness.loc[
-                    dataset_data.index.intersection(original_index)
-                ].copy()
-                # Check for duplicated rows
-                new_indices = dataset_data.index.difference(original_index)
-                new_missingness = dataset_data.loc[new_indices].isna() | (
-                    dataset_data.loc[new_indices] == ""
-                )
-                missingness = pd.concat([missingness, new_missingness])
 
         elif isinstance(noise_type, ColumnNoiseType):
             if Keys.COLUMN_NOISE in noise_configuration:
@@ -97,20 +84,14 @@ def noise_dataset(
                     if col in dataset_data.columns
                     and noise_type.name in noise_configuration.column_noise[col]
                 ]
-                # Apply column noise to each column as appropriate
                 for column in columns_to_noise:
-                    required_cols = [column] + noise_type.additional_column_getter(column)
-                    dataset_data[column], index_noised = noise_type(
-                        dataset_data[required_cols],
+                    dataset_data = noise_type(
+                        dataset_data,
                         noise_configuration.column_noise[column][noise_type.name],
                         randomness,
                         dataset.name,
                         column,
-                        missingness=missingness[required_cols],
                     )
-                    if noise_type == NOISE_TYPES.leave_blank:
-                        # The only situation in which more missingness is introduced
-                        missingness.loc[index_noised, column] = True
         else:
             raise TypeError(
                 f"Invalid noise type. Allowed types are {RowNoiseType} and "

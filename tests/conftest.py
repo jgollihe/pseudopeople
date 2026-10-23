@@ -2,10 +2,10 @@ import os
 import warnings
 from functools import cache
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Tuple, Union
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 import scipy.stats
 from _pytest.logging import LogCaptureFixture
@@ -13,6 +13,7 @@ from loguru import logger
 
 
 def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", default=False, help="run slow tests")
     parser.addoption(
         "--limit",
         action="store",
@@ -148,12 +149,12 @@ class FuzzyChecker:
         else:
             target_lower_bound = target_upper_bound = target_proportion
 
-        assert (
-            observed_numerator <= observed_denominator
-        ), f"There cannot be more events ({observed_numerator}) than opportunities for events ({observed_denominator})"
-        assert (
-            target_upper_bound >= target_lower_bound
-        ), f"The lower bound of the V&V target ({target_lower_bound}) cannot be greater than the upper bound ({target_upper_bound})"
+        assert observed_numerator <= observed_denominator, (
+            f"There cannot be more events ({observed_numerator}) than opportunities for events ({observed_denominator})"
+        )
+        assert target_upper_bound >= target_lower_bound, (
+            f"The lower bound of the V&V target ({target_lower_bound}) cannot be greater than the upper bound ({target_upper_bound})"
+        )
 
         bug_issue_alpha, bug_issue_beta = bug_issue_beta_distribution_parameters
         bug_issue_distribution = scipy.stats.betabinom(
@@ -311,11 +312,10 @@ class FuzzyChecker:
         Can be useful to get more information about warnings, or to prioritize
         areas to be more thorough in manual V&V.
         """
-        output = pd.DataFrame(self.proportion_test_diagnostics)
-        output.to_csv(
-            Path(os.path.dirname(__file__))
-            / "v_and_v_output/proportion_test_diagnostics.csv",
-            index=False,
+        output_dir = Path(os.path.dirname(__file__)) / "v_and_v_output"
+        output_dir.mkdir(exist_ok=True)
+        pl.DataFrame(self.proportion_test_diagnostics, infer_schema_length=None).write_csv(
+            output_dir / "proportion_test_diagnostics.csv"
         )
 
 

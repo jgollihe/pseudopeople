@@ -1,7 +1,7 @@
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import pandas as pd
 import yaml
 from vivarium.config_tree import ConfigTree
 
@@ -83,7 +83,7 @@ DEFAULT_NOISE_VALUES = {
 def get_configuration(
     overrides: Optional[Union[Path, str, Dict]] = None,
     dataset: Dataset = None,
-    user_filters: List[Tuple[Union[str, int, pd.Timestamp]]] = None,
+    user_filters: List[Tuple[Union[str, int, datetime]]] = None,
 ) -> ConfigTree:
     """
     Gets a noising configuration ConfigTree, optionally overridden by a user-provided YAML.
@@ -178,7 +178,7 @@ def add_overrides(
     noising_configuration: ConfigTree,
     overrides: Dict,
     dataset: Dataset = None,
-    user_filters: List[Tuple[Union[str, int, pd.Timestamp]]] = None,
+    user_filters: List[Tuple[Union[str, int, datetime]]] = None,
 ) -> None:
     validate_overrides(overrides, noising_configuration)
     overrides = _format_overrides(noising_configuration, overrides)

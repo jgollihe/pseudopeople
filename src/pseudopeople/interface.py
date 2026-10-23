@@ -1,8 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-import numpy as np
-import pandas as pd
+import polars as pl
 from loguru import logger
 from packaging.version import parse
 from tqdm import tqdm
@@ -12,20 +13,24 @@ from pseudopeople import __version__ as psp_version
 from pseudopeople.configuration import get_configuration
 from pseudopeople.constants import paths
 from pseudopeople.constants.metadata import DATEFORMATS
-from pseudopeople.constants.noise_type_metadata import COPY_HOUSEHOLD_MEMBER_COLS
-from pseudopeople.dtypes import DtypeNames
+from pseudopeople.constants.noise_type_metadata import (
+    COPY_HOUSEHOLD_MEMBER_COLS,
+    INT_TO_STRING_COLUMNS,
+)
+from pseudopeople.dtypes import DtypeNames, to_polars_dtype
 from pseudopeople.exceptions import DataSourceError
-from pseudopeople.loader import load_standard_dataset
+from pseudopeople.loader import scan_standard_dataset
 from pseudopeople.noise import noise_dataset
 from pseudopeople.schema_entities import COLUMNS, DATASETS, Dataset
 from pseudopeople.utilities import (
-    PANDAS_ENGINE,
-    DataFrame,
     configure_logging_to_terminal,
-    get_engine_from_string,
     get_state_abbreviation,
-    to_string,
+    to_string_expr,
 )
+
+# Beyond a few concurrent shards, Polars' own multithreading already uses the CPU,
+# and each additional shard in flight costs memory.
+DEFAULT_MAX_WORKERS = 4
 
 
 def _generate_dataset(
@@ -35,8 +40,9 @@ def _generate_dataset(
     config: Union[Path, str, Dict],
     user_filters: List[tuple],
     verbose: bool = False,
-    engine_name: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Helper for generating noised datasets.
 
@@ -49,13 +55,18 @@ def _generate_dataset(
     :param config:
         Object to configure noise levels
     :param user_filters:
-        List of parquet filters, possibly empty
+        List of (column, operator, value) filters, possibly empty
     :param verbose:
         Log with verbosity if True. Default is False.
-    :param engine_name:
-        String indicating engine to use for loading data. Determines the return type.
+    :param output_path:
+        Directory to write one noised parquet file per input shard to. If
+        given, a LazyFrame scanning the written files is returned instead of
+        a DataFrame, so the full dataset never has to fit in memory.
+    :param n_workers:
+        Number of data files to noise at the same time. Defaults to
+        DEFAULT_MAX_WORKERS (capped at the number of files).
     :return:
-        Noised dataset data in a dataframe
+        Noised dataset data
     """
     configure_logging_to_terminal(verbose)
     configuration_tree = get_configuration(config, dataset, user_filters)
@@ -66,114 +77,88 @@ def _generate_dataset(
         source = Path(source)
         validate_source_compatibility(source, dataset)
 
-    engine = get_engine_from_string(engine_name)
-
-    if engine == PANDAS_ENGINE:
-        # We process shards serially
-        data_file_paths = fetch_filepaths(dataset, source)
-        if not data_file_paths:
-            raise DataSourceError(
-                f"No datasets found at directory {str(source)}. "
-                "Please provide the path to the unmodified root data directory."
-            )
-
-        validate_data_path_suffix(data_file_paths)
-
-        # Iterate sequentially
-        noised_dataset = []
-        iterator = (
-            tqdm(data_file_paths, desc="Noising data", leave=False)
-            if len(data_file_paths) > 1
-            else data_file_paths
+    data_file_paths = fetch_filepaths(dataset, source)
+    if not data_file_paths:
+        raise DataSourceError(
+            f"No datasets found at directory {str(source)}. "
+            "Please provide the path to the unmodified root data directory."
         )
+    validate_data_path_suffix(data_file_paths)
 
-        for data_file_index, data_file_path in enumerate(iterator):
-            logger.debug(f"Loading data from {data_file_path}.")
-            data = load_standard_dataset(
-                data_file_path, user_filters, engine=engine, is_file=True
-            )
-            if len(data.index) == 0:
-                continue
-            # Use a different seed for each data file/shard, otherwise the randomness will duplicate
-            # and the Nth row in each shard will get the same noise
-            data_path_seed = f"{seed}_{data_file_index}"
-            noised_data = _prep_and_noise_dataset(
-                data, dataset, configuration_tree, data_path_seed
-            )
-            noised_dataset.append(noised_data)
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
 
-        # Check if all shards for the dataset are empty
-        if len(noised_dataset) == 0:
-            raise ValueError(
-                "Invalid value provided for 'state' or 'year'. No data found with "
-                f"the user provided 'state' or 'year' filters at {source / dataset.name}."
-            )
-        noised_dataset = pd.concat(noised_dataset, ignore_index=True)
+    if n_workers is None:
+        n_workers = DEFAULT_MAX_WORKERS
+    n_workers = max(1, min(n_workers, len(data_file_paths)))
 
-        noised_dataset = _coerce_dtypes(
-            noised_dataset,
+    def noise_shard(data_file_index: int) -> Union[pl.DataFrame, Path, None]:
+        data_file_path = data_file_paths[data_file_index]
+        logger.debug(f"Loading data from {data_file_path}.")
+        data = scan_standard_dataset(data_file_path, user_filters)
+        # Use a different seed for each data file/shard, otherwise the randomness will duplicate
+        # and the Nth row in each shard will get the same noise
+        data_path_seed = f"{seed}_{data_file_index}"
+        noised_data = _prep_and_noise_dataset(
+            data,
             dataset,
+            configuration_tree,
+            data_path_seed,
+            progress_bar=len(data_file_paths) == 1,
         )
-    else:
-        try:
-            from distributed.client import default_client
+        if noised_data is None:
+            return None
+        noised_data = _coerce_dtypes(noised_data, dataset)
+        if output_path is None:
+            return noised_data
+        file_path = output_path / f"{dataset.name}_{data_file_index}.parquet"
+        noised_data.write_parquet(file_path)
+        return file_path
 
-            default_client().run(lambda: configure_logging_to_terminal(verbose))
-        except (ImportError, ValueError):
-            # Not using a distributed cluster, so the configure_logging_to_terminal call above already did everything
-            pass
-
-        # Let dask deal with how to partition the shards -- we pass it the
-        # entire directory containing the parquet files
-        data_directory_path = source / dataset.name
-        import dask
-
-        # Our work depends on the particulars of how dtypes work, and is only
-        # built to work with NumPy dtypes, so we turn off the Dask default behavior
-        # of using PyArrow dtypes.
-        with dask.config.set({"dataframe.convert-string": False}):
-            data = load_standard_dataset(
-                data_directory_path, user_filters, engine=engine, is_file=False
+    shard_indices = range(len(data_file_paths))
+    # Polars releases the GIL, so threads let several shards use the CPU at once.
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = executor.map(noise_shard, shard_indices)
+        if len(data_file_paths) > 1:
+            results = tqdm(
+                results, total=len(data_file_paths), desc="Noising data", leave=False
             )
-            # We are about to check the length, which requires computation anyway, so we cache
-            # that computation
-            data = data.persist()
+        # executor.map yields in shard order, so output order does not depend on n_workers
+        results = [result for result in results if result is not None]
 
-            # Check if all shards for the dataset are empty
-            if len(data) == 0:
-                raise ValueError(
-                    "Invalid value provided for 'state' or 'year'. No data found with "
-                    f"the user provided 'state' or 'year' filters at {data_directory_path}."
-                )
+    noised_shards = [r for r in results if isinstance(r, pl.DataFrame)]
+    written_files = [r for r in results if isinstance(r, Path)]
 
-            noised_dataset = data.map_partitions(
-                lambda df, partition_info=None: _coerce_dtypes(
-                    _prep_and_noise_dataset(
-                        df,
-                        dataset,
-                        configuration_tree,
-                        seed=f"{seed}_{partition_info['number'] if partition_info is not None else 1}",
-                        progress_bar=False,
-                    ),
-                    dataset,
-                ),
-                meta=[(c.name, c.dtype_name) for c in dataset.columns],
-            )
+    # Check if all shards for the dataset are empty
+    if not noised_shards and not written_files:
+        raise ValueError(
+            "Invalid value provided for 'state' or 'year'. No data found with "
+            f"the user provided 'state' or 'year' filters at {source / dataset.name}."
+        )
 
     logger.debug("*** Finished ***")
-
-    return noised_dataset
+    if output_path is not None:
+        return pl.scan_parquet(written_files)
+    return pl.concat(noised_shards, how="vertical")
 
 
 def _prep_and_noise_dataset(
-    data: pd.DataFrame,
+    data: Union[pl.DataFrame, pl.LazyFrame],
     dataset: Dataset,
     configuration_tree: ConfigTree,
     seed: Any,
     progress_bar: bool = True,
-) -> pd.DataFrame:
+) -> Optional[pl.DataFrame]:
+    """Noises the data, or returns None if there is none (e.g. after filtering)."""
     data = _reformat_dates_for_noising(data, dataset)
     data = _clean_input_data(data, dataset)
+    if isinstance(data, pl.LazyFrame):
+        # Doing the prep as part of the parquet scan avoids materializing
+        # intermediate copies of every string column.
+        data = data.collect()
+    if data.is_empty():
+        return None
     noised_data = noise_dataset(
         dataset, data, configuration_tree, seed, progress_bar=progress_bar
     )
@@ -220,83 +205,87 @@ def _get_data_changelog_version(changelog):
     return version
 
 
+def _string_columns_for_noising(dataset: Dataset) -> Dict[str, str]:
+    """
+    Output string columns, plus the columns their values may be copied from,
+    mapped to the output column whose string format they should follow.
+    """
+    columns = [c.name for c in dataset.columns if c.dtype_name == DtypeNames.OBJECT]
+    copy_columns = {
+        COPY_HOUSEHOLD_MEMBER_COLS[c]: c for c in columns if c in COPY_HOUSEHOLD_MEMBER_COLS
+    }
+    return {c: c for c in columns} | copy_columns
+
+
 def _clean_input_data(
-    data: pd.DataFrame,
+    data: Union[pl.DataFrame, pl.LazyFrame],
     dataset: Dataset,
-) -> pd.DataFrame:
-    for col in dataset.columns:
-        # Coerce empty strings to nans
-        data[col.name] = data[col.name].replace("", np.nan)
+) -> Union[pl.DataFrame, pl.LazyFrame]:
+    """
+    Puts input data in the form noising expects: all missing values are nulls,
+    categorical (dictionary-encoded) columns are plain strings, and output
+    string columns are strings.
+    """
+    string_columns = _string_columns_for_noising(dataset)
 
-        if data[col.name].dtype.name == "category" and col.dtype_name == DtypeNames.OBJECT:
-            # We made some columns in the pseudopeople input categorical
-            # purely as a kind of DIY compression.
-            # TODO: Determine whether this is benefitting us after
-            # the switch to Parquet.
-            data[col.name] = to_string(data[col.name])
+    def cleaned(column: str, dtype: pl.DataType) -> pl.Expr:
+        expr = pl.col(column)
+        if dtype in (pl.Categorical, pl.Enum):
+            expr, dtype = expr.cast(pl.String), pl.String()
+        elif column in string_columns and dtype != pl.String:
+            integer_valued = string_columns[column] in INT_TO_STRING_COLUMNS
+            expr = to_string_expr(column, dtype, integer_valued=integer_valued)
+            dtype = pl.String()
+        if dtype == pl.String:
+            # Coerce empty strings to nulls
+            expr = pl.when(expr != "").then(expr)
+        return expr.alias(column)
 
-    return data
+    return data.with_columns(
+        cleaned(column, dtype) for column, dtype in data.collect_schema().items()
+    )
 
 
 def _coerce_dtypes(
-    data: pd.DataFrame,
+    data: pl.DataFrame,
     dataset: Dataset,
-) -> pd.DataFrame:
-    for col in dataset.columns:
-        if col.dtype_name != data[col.name].dtype.name:
-            if col.dtype_name == DtypeNames.OBJECT:
-                data[col.name] = to_string(data[col.name])
-            else:
-                data[col.name] = data[col.name].astype(col.dtype_name)
+) -> pl.DataFrame:
+    return data.with_columns(
+        (
+            to_string_expr(col.name, data.schema[col.name])
+            if col.dtype_name == DtypeNames.OBJECT
+            else pl.col(col.name).cast(to_polars_dtype(col.dtype_name))
+        )
+        for col in dataset.columns
+        if col.name in data.columns
+    )
 
-    return data
 
-
-def _reformat_dates_for_noising(data: pd.DataFrame, dataset: Dataset):
+def _reformat_dates_for_noising(
+    data: Union[pl.DataFrame, pl.LazyFrame], dataset: Dataset
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """Formats date columns so they can be noised as strings."""
-    data = data.copy()
-
+    if dataset.date_format not in (
+        DATEFORMATS.YYYYMMDD,
+        DATEFORMATS.MM_DD_YYYY,
+        DATEFORMATS.MMDDYYYY,
+    ):
+        raise ValueError(f"Invalid date format in {dataset.name}.")
+    schema = data.collect_schema()
+    date_columns = []
     for date_column in [COLUMNS.dob.name, COLUMNS.ssa_event_date.name]:
         # Format both the actual column, and the shadow version that will be used
         # to copy from a household member
         for column in [date_column, COPY_HOUSEHOLD_MEMBER_COLS.get(date_column)]:
-            if column in data.columns:
-                # Avoid running strftime on large data, since that will
-                # re-parse the format string for each row
-                # https://github.com/pandas-dev/pandas/issues/44764
-                # Year is already guaranteed to be 4-digit: https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#timeseries-timestamp-limits
-                is_na = data[column].isna()
-                data_column = data.loc[~is_na, column]
-                year_string = data_column.dt.year.astype(str)
-                month_string = _zfill_fast(data_column.dt.month.astype(str), 2)
-                day_string = _zfill_fast(data_column.dt.day.astype(str), 2)
-                if dataset.date_format == DATEFORMATS.YYYYMMDD:
-                    result = year_string + month_string + day_string
-                elif dataset.date_format == DATEFORMATS.MM_DD_YYYY:
-                    result = month_string + "/" + day_string + "/" + year_string
-                elif dataset.date_format == DATEFORMATS.MMDDYYYY:
-                    result = month_string + day_string + year_string
-                else:
-                    raise ValueError(f"Invalid date format in {dataset.name}.")
-
-                data[column] = pd.Series(np.nan, dtype=str)
-                data.loc[~is_na, column] = result
-
-    return data
-
-
-def _zfill_fast(col: pd.Series, desired_length: int) -> pd.Series:
-    """Performs the same operation as col.str.zfill(desired_length), but vectorized."""
-    # The most zeroes that could ever be needed would be desired_length
-    maximum_padding = ("0" * desired_length) + col
-    # Now trim to only the zeroes needed
-    return maximum_padding.str[-desired_length:]
+            if column in schema and schema[column].is_temporal():
+                date_columns.append(column)
+    return data.with_columns(pl.col(date_columns).dt.strftime(dataset.date_format))
 
 
 def _extract_columns(columns_to_keep, noised_dataset):
     """Helper function for test mocking purposes"""
     if columns_to_keep:
-        noised_dataset = noised_dataset[[c.name for c in columns_to_keep]]
+        noised_dataset = noised_dataset.select([c.name for c in columns_to_keep])
     return noised_dataset
 
 
@@ -307,8 +296,9 @@ def generate_decennial_census(
     year: Optional[int] = 2020,
     state: Optional[str] = None,
     verbose: bool = False,
-    engine: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople decennial census dataset which represents
     simulated responses to the US Census Bureau's Census of Population
@@ -352,14 +342,21 @@ def generate_decennial_census(
 
         Log with verbosity if `True`. Default is `False`.
 
-    :param engine:
+    :param output_path:
 
-        Engine to use for loading data. Determines the return type.
-        Default is "pandas" which returns a pandas DataFrame.
-        "dask" returns a Dask DataFrame and requires Dask to be
-        installed (e.g. `pip install pseudopeople[dask]`).
-        It runs the dataset generation on a Dask cluster, which can
-        parallelize and run out-of-core.
+        An optional directory to write the noised dataset to, as one
+        parquet file per simulated population data file. When provided,
+        each file is written as soon as it is noised, so the full dataset
+        never needs to fit in memory, and a Polars LazyFrame scanning the
+        written files is returned. Default is `None`, which returns a
+        Polars DataFrame.
+
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
 
     :return:
 
@@ -387,7 +384,14 @@ def generate_decennial_census(
             (DATASETS.census.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.census, source, seed, config, user_filters, verbose, engine_name=engine
+        DATASETS.census,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -398,8 +402,9 @@ def generate_american_community_survey(
     year: Optional[int] = 2020,
     state: Optional[str] = None,
     verbose: bool = False,
-    engine: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople ACS dataset which represents simulated
     responses to the ACS survey.
@@ -450,14 +455,21 @@ def generate_american_community_survey(
 
         Log with verbosity if `True`. Default is `False`.
 
-    :param engine:
+    :param output_path:
 
-        Engine to use for loading data. Determines the return type.
-        Default is "pandas" which returns a pandas DataFrame.
-        "dask" returns a Dask DataFrame and requires Dask to be
-        installed (e.g. `pip install pseudopeople[dask]`).
-        It runs the dataset generation on a Dask cluster, which can
-        parallelize and run out-of-core.
+        An optional directory to write the noised dataset to, as one
+        parquet file per simulated population data file. When provided,
+        each file is written as soon as it is noised, so the full dataset
+        never needs to fit in memory, and a Polars LazyFrame scanning the
+        written files is returned. Default is `None`, which returns a
+        Polars DataFrame.
+
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
 
     :return:
 
@@ -485,16 +497,16 @@ def generate_american_community_survey(
                     (
                         DATASETS.acs.date_column_name,
                         ">=",
-                        pd.Timestamp(year=year, month=1, day=1),
+                        datetime(year, 1, 1),
                     ),
                     (
                         DATASETS.acs.date_column_name,
                         "<=",
-                        pd.Timestamp(year=year, month=12, day=31),
+                        datetime(year, 12, 31),
                     ),
                 ]
             )
-        except (pd.errors.OutOfBoundsDatetime, ValueError):
+        except (ValueError, OverflowError, TypeError):
             raise ValueError(f"Invalid year provided: '{year}'")
         seed = seed * 10_000 + year
     if state is not None:
@@ -502,7 +514,14 @@ def generate_american_community_survey(
             [(DATASETS.acs.state_column_name, "==", get_state_abbreviation(state))]
         )
     return _generate_dataset(
-        DATASETS.acs, source, seed, config, user_filters, verbose, engine_name=engine
+        DATASETS.acs,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -513,8 +532,9 @@ def generate_current_population_survey(
     year: Optional[int] = 2020,
     state: Optional[str] = None,
     verbose: bool = False,
-    engine: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople CPS dataset which represents simulated
     responses to the CPS survey.
@@ -566,14 +586,21 @@ def generate_current_population_survey(
 
         Log with verbosity if `True`. Default is `False`.
 
-    :param engine:
+    :param output_path:
 
-        Engine to use for loading data. Determines the return type.
-        Default is "pandas" which returns a pandas DataFrame.
-        "dask" returns a Dask DataFrame and requires Dask to be
-        installed (e.g. `pip install pseudopeople[dask]`).
-        It runs the dataset generation on a Dask cluster, which can
-        parallelize and run out-of-core.
+        An optional directory to write the noised dataset to, as one
+        parquet file per simulated population data file. When provided,
+        each file is written as soon as it is noised, so the full dataset
+        never needs to fit in memory, and a Polars LazyFrame scanning the
+        written files is returned. Default is `None`, which returns a
+        Polars DataFrame.
+
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
 
     :return:
 
@@ -601,16 +628,16 @@ def generate_current_population_survey(
                     (
                         DATASETS.cps.date_column_name,
                         ">=",
-                        pd.Timestamp(year=year, month=1, day=1),
+                        datetime(year, 1, 1),
                     ),
                     (
                         DATASETS.cps.date_column_name,
                         "<=",
-                        pd.Timestamp(year=year, month=12, day=31),
+                        datetime(year, 12, 31),
                     ),
                 ]
             )
-        except (pd.errors.OutOfBoundsDatetime, ValueError):
+        except (ValueError, OverflowError, TypeError):
             raise ValueError(f"Invalid year provided: '{year}'")
         seed = seed * 10_000 + year
     if state is not None:
@@ -618,7 +645,14 @@ def generate_current_population_survey(
             [(DATASETS.cps.state_column_name, "==", get_state_abbreviation(state))]
         )
     return _generate_dataset(
-        DATASETS.cps, source, seed, config, user_filters, verbose, engine_name=engine
+        DATASETS.cps,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -629,8 +663,9 @@ def generate_taxes_w2_and_1099(
     year: Optional[int] = 2020,
     state: Optional[str] = None,
     verbose: bool = False,
-    engine: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople W2 and 1099 tax dataset which represents
     simulated tax form data.
@@ -673,14 +708,21 @@ def generate_taxes_w2_and_1099(
 
         Log with verbosity if `True`. Default is `False`.
 
-    :param engine:
+    :param output_path:
 
-        Engine to use for loading data. Determines the return type.
-        Default is "pandas" which returns a pandas DataFrame.
-        "dask" returns a Dask DataFrame and requires Dask to be
-        installed (e.g. `pip install pseudopeople[dask]`).
-        It runs the dataset generation on a Dask cluster, which can
-        parallelize and run out-of-core.
+        An optional directory to write the noised dataset to, as one
+        parquet file per simulated population data file. When provided,
+        each file is written as soon as it is noised, so the full dataset
+        never needs to fit in memory, and a Polars LazyFrame scanning the
+        written files is returned. Default is `None`, which returns a
+        Polars DataFrame.
+
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
 
     :return:
 
@@ -709,7 +751,14 @@ def generate_taxes_w2_and_1099(
             (DATASETS.tax_w2_1099.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.tax_w2_1099, source, seed, config, user_filters, verbose, engine_name=engine
+        DATASETS.tax_w2_1099,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -720,8 +769,9 @@ def generate_women_infants_and_children(
     year: Optional[int] = 2020,
     state: Optional[str] = None,
     verbose: bool = False,
-    engine: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople WIC dataset which represents a simulated
     version of the administrative data that would be recorded by WIC.
@@ -775,14 +825,21 @@ def generate_women_infants_and_children(
 
         Log with verbosity if `True`. Default is `False`.
 
-    :param engine:
+    :param output_path:
 
-        Engine to use for loading data. Determines the return type.
-        Default is "pandas" which returns a pandas DataFrame.
-        "dask" returns a Dask DataFrame and requires Dask to be
-        installed (e.g. `pip install pseudopeople[dask]`).
-        It runs the dataset generation on a Dask cluster, which can
-        parallelize and run out-of-core.
+        An optional directory to write the noised dataset to, as one
+        parquet file per simulated population data file. When provided,
+        each file is written as soon as it is noised, so the full dataset
+        never needs to fit in memory, and a Polars LazyFrame scanning the
+        written files is returned. Default is `None`, which returns a
+        Polars DataFrame.
+
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
 
     :return:
 
@@ -811,7 +868,14 @@ def generate_women_infants_and_children(
             (DATASETS.wic.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.wic, source, seed, config, user_filters, verbose, engine_name=engine
+        DATASETS.wic,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -821,8 +885,9 @@ def generate_social_security(
     config: Union[Path, str, Dict[str, Dict]] = None,
     year: Optional[int] = 2020,
     verbose: bool = False,
-    engine: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople SSA dataset which represents simulated
     Social Security Administration (SSA) data.
@@ -856,14 +921,21 @@ def generate_social_security(
 
         Log with verbosity if `True`. Default is `False`.
 
-    :param engine:
+    :param output_path:
 
-        Engine to use for loading data. Determines the return type.
-        Default is "pandas" which returns a pandas DataFrame.
-        "dask" returns a Dask DataFrame and requires Dask to be
-        installed (e.g. `pip install pseudopeople[dask]`).
-        It runs the dataset generation on a Dask cluster, which can
-        parallelize and run out-of-core.
+        An optional directory to write the noised dataset to, as one
+        parquet file per simulated population data file. When provided,
+        each file is written as soon as it is noised, so the full dataset
+        never needs to fit in memory, and a Polars LazyFrame scanning the
+        written files is returned. Default is `None`, which returns a
+        Polars DataFrame.
+
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
 
     :return:
 
@@ -890,14 +962,21 @@ def generate_social_security(
                 (
                     DATASETS.ssa.date_column_name,
                     "<=",
-                    pd.Timestamp(year=year, month=12, day=31),
+                    datetime(year, 12, 31),
                 )
             )
-        except (pd.errors.OutOfBoundsDatetime, ValueError):
+        except (ValueError, OverflowError, TypeError):
             raise ValueError(f"Invalid year provided: '{year}'")
         seed = seed * 10_000 + year
     return _generate_dataset(
-        DATASETS.ssa, source, seed, config, user_filters, verbose, engine_name=engine
+        DATASETS.ssa,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 
@@ -908,8 +987,9 @@ def generate_taxes_1040(
     year: Optional[int] = 2020,
     state: Optional[str] = None,
     verbose: bool = False,
-    engine: Literal["pandas", "dask"] = "pandas",
-) -> DataFrame:
+    output_path: Optional[Union[Path, str]] = None,
+    n_workers: Optional[int] = None,
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Generates a pseudopeople 1040 tax dataset which represents simulated
     tax form data.
@@ -952,14 +1032,21 @@ def generate_taxes_1040(
 
         Log with verbosity if `True`. Default is `False`.
 
-    :param engine:
+    :param output_path:
 
-        Engine to use for loading data. Determines the return type.
-        Default is "pandas" which returns a pandas DataFrame.
-        "dask" returns a Dask DataFrame and requires Dask to be
-        installed (e.g. `pip install pseudopeople[dask]`).
-        It runs the dataset generation on a Dask cluster, which can
-        parallelize and run out-of-core.
+        An optional directory to write the noised dataset to, as one
+        parquet file per simulated population data file. When provided,
+        each file is written as soon as it is noised, so the full dataset
+        never needs to fit in memory, and a Polars LazyFrame scanning the
+        written files is returned. Default is `None`, which returns a
+        Polars DataFrame.
+
+    :param n_workers:
+
+        The number of simulated population data files to noise at the
+        same time. More workers are faster but use more memory, since
+        each holds one data file in memory. Defaults to `None`, which
+        uses up to 4. The result does not depend on this value.
 
     :return:
 
@@ -988,7 +1075,14 @@ def generate_taxes_1040(
             (DATASETS.tax_1040.state_column_name, "==", get_state_abbreviation(state))
         )
     return _generate_dataset(
-        DATASETS.tax_1040, source, seed, config, user_filters, verbose, engine_name=engine
+        DATASETS.tax_1040,
+        source,
+        seed,
+        config,
+        user_filters,
+        verbose,
+        output_path=output_path,
+        n_workers=n_workers,
     )
 
 

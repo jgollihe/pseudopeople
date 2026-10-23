@@ -1,6 +1,5 @@
 import itertools
 
-import pandas as pd
 import pytest
 import yaml
 

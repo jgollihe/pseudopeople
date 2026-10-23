@@ -1,38 +1,25 @@
 import math
 
-import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
-from vivarium.engine.framework.randomness import RandomnessStream
-from vivarium.engine.framework.randomness.index_map import IndexMap
 
 from pseudopeople.configuration import Keys, get_configuration
 from pseudopeople.constants.noise_type_metadata import COPY_HOUSEHOLD_MEMBER_COLS
 from pseudopeople.data.fake_names import fake_first_names, fake_last_names
 from pseudopeople.noise_entities import NOISE_TYPES
+from pseudopeople.noise_scaling import load_nicknames_data
+from pseudopeople.randomness import ROW_ID, Randomness
 from pseudopeople.schema_entities import DATASETS
 from pseudopeople.utilities import (
+    TOKEN,
     load_ocr_errors,
     load_phonetic_errors,
     load_qwerty_errors_data,
-    to_string_as_integer,
 )
 from tests.conftest import FuzzyChecker
 
-RANDOMNESS0 = RandomnessStream(
-    key="test_column_noise",
-    clock=lambda: pd.Timestamp("2020-09-01"),
-    seed=0,
-    index_map=IndexMap(),
-    component=None,
-)
-RANDOMNESS1 = RandomnessStream(
-    key="test_column_noise",
-    clock=lambda: pd.Timestamp("2020-09-01"),
-    seed=1,
-    index_map=IndexMap(),
-    component=None,
-)
+RANDOMNESS0 = Randomness("test_column_noise_0")
+RANDOMNESS1 = Randomness("test_column_noise_1")
 CHARACTERS_LIST = [
     "A",
     "test123",
@@ -156,9 +143,6 @@ OCR_STRESS_TEST_PATHWAYS = {
         "LII-IU": (1, 2),
         "UHIJ": (2, 1),
         "UI-IU": (2, 1),
-        "UHIJ": (2, 1),
-        "LIHU": (2, 1),
-        "UI-IU": (2, 1),
         "LIHU": (2, 1),
         "UHU": (3, 0),
     },
@@ -182,95 +166,59 @@ STRING_LIST = [
     "100000.00",
     "123-45-6789",
 ]
+NUM_SIMULANTS = 1_000_000
+
+
+def _cycle(values: list, n: int = NUM_SIMULANTS) -> list:
+    return (values * (n // len(values) + 1))[:n]
 
 
 @pytest.fixture(scope="module")
-def dummy_dataset():
-    num_simulants = 1_000_000
-    dummy_idx = pd.Index(range(num_simulants))
-
-    # Add a column of integer strings
-    integer_series = pd.Series(
-        [str(x) for x in INTEGERS_LIST] * int(num_simulants / len(INTEGERS_LIST))
-    )
-    # integer_series = pd.Series(["Jenny 867-5309", "foo"]*int(num_simulants/2))
-    # Add missing data from `leave_blanks` function
-    missing_idx = pd.Index([x for x in dummy_idx if x % 3 == 0])
-    integer_series.loc[missing_idx] = ""
-
-    # Add a column of character strings
-    character_list = CHARACTERS_LIST + [""]
-    character_series = pd.Series(character_list * int(num_simulants / len(character_list)))
-
-    # Add a categorical series state column
-    states_list = ["CA", "WA", "FL", "OR", "CO", "TX", "NY", "VA", "AZ", "''"]
-    states = pd.Series(states_list * int(num_simulants / len(states_list)))
-
-    # Add age col by converting integer_series
+def dummy_dataset() -> pl.DataFrame:
+    """Data in the form column noise sees it: strings, with nulls for missing values."""
     maximum_age = 120
-    ages = integer_series.apply(pd.to_numeric, args=("coerce",))
-    ages = ages / ages.max() * (maximum_age + 1)
-    ages = ages.astype(float).round()
-
-    # Add a string_series column of mixed letters and numbers
-    string_series = pd.Series(
-        (STRING_LIST + [""]) * int(num_simulants / (len(STRING_LIST) + 1))
-    )
-    zipcodes = ["12345", "98765", "02468", "13579", ""]
-    zipcode_series = pd.Series(zipcodes * int(num_simulants / len(zipcodes)))
-    first_names = FIRST_NAMES + [""]
-    first_name_series = pd.Series(first_names * int(num_simulants / len(first_names)))
-    last_names = LAST_NAMES + [""]
-    last_name_series = pd.Series(last_names * int(num_simulants / len(last_names)))
-    event_date_list = ["01/25/1990", "05/30/1995", "10/01/2000", "12/31/2010", np.nan]
-    event_date_series = pd.Series(event_date_list * int(num_simulants / len(event_date_list)))
-    date_of_birth_list = ["01/31/1950", "05/01/1990", "10/01/2000", "12/31/2010", np.nan]
-    date_of_birth_series = pd.Series(
-        date_of_birth_list * int(num_simulants / len(date_of_birth_list))
-    )
-    copy_age_list = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, np.nan, 100.0]
-    copy_age_series = pd.Series(copy_age_list * int(num_simulants / len(copy_age_list)))
-
-    phonetic_stress_test_series = pd.Series(
-        (PHONETIC_STRESS_TEST_LIST + [""])
-        * int(num_simulants / (len(PHONETIC_STRESS_TEST_LIST) + 1))
-    )
-    ocr_stress_test_series = pd.Series(
-        (OCR_STRESS_TEST_LIST + [""]) * int(num_simulants / (len(OCR_STRESS_TEST_LIST) + 1))
-    )
-
-    return pd.DataFrame(
-        {
-            "numbers": integer_series,
-            "characters": character_series,
-            "state": states,
-            "age": ages,
-            "street_number": string_series,
-            "zipcode": zipcode_series,
-            "first_name": first_name_series,
-            "last_name": last_name_series,
-            "event_date": event_date_series,
-            "date_of_birth": date_of_birth_series,
-            "copy_age": copy_age_series,
-            "phonetic_stress_test": phonetic_stress_test_series,
-            "ocr_stress_test": ocr_stress_test_series,
-        }
+    max_integer = max(INTEGERS_LIST)
+    numbers = pl.Series(_cycle([str(x) for x in INTEGERS_LIST]))
+    is_missing = pl.int_range(NUM_SIMULANTS, eager=True) % 3 == 0
+    return (
+        pl.DataFrame(
+            {
+                "numbers": numbers,
+                "characters": _cycle(CHARACTERS_LIST + [None]),
+                "state": _cycle(["CA", "WA", "FL", "OR", "CO", "TX", "NY", "VA", "AZ", "''"]),
+                "age": (numbers.cast(pl.Int64) / max_integer * (maximum_age + 1))
+                .round()
+                .cast(pl.Int64)
+                .cast(pl.String),
+                "street_number": _cycle(STRING_LIST + [None]),
+                "zipcode": _cycle(["12345", "98765", "02468", "13579", None]),
+                "first_name": _cycle(FIRST_NAMES + [None]),
+                "last_name": _cycle(LAST_NAMES + [None]),
+                "event_date": _cycle(
+                    ["01/25/1990", "05/30/1995", "10/01/2000", "12/31/2010", None]
+                ),
+                "date_of_birth": _cycle(
+                    ["01/31/1950", "05/01/1990", "10/01/2000", "12/31/2010", None]
+                ),
+                "copy_age": _cycle(
+                    ["10", "20", "30", "40", "50", "60", "70", "80", None, "100"]
+                ),
+                "phonetic_stress_test": _cycle(PHONETIC_STRESS_TEST_LIST + [None]),
+                "ocr_stress_test": _cycle(OCR_STRESS_TEST_LIST + [None]),
+            }
+        )
+        .with_columns(pl.when(~is_missing).then(pl.col("numbers", "age")).name.keep())
+        .with_row_index(ROW_ID)
     )
 
 
-@pytest.fixture(scope="module")
-def categorical_series():
-    return pd.Series(
-        ["CA", "WA", "FL", "OR", "CO", "TX", "NY", "VA", "AZ", "''"] * 100_000, name="state"
-    )
+def _noise(noise_type, data, config, randomness, dataset_name, column) -> pl.Series:
+    """Apply a column noise type and return the noised column."""
+    return noise_type(data, config, randomness, dataset_name, column)[column]
 
 
-@pytest.fixture(scope="module")
-def string_series():
-    return pd.Series(
-        ["Unit 1A", "1234", "12/31/2020", "a1b2c3", "100000.00", "123-45-6789", ""] * 100_000,
-        name="random_strings",
-    )
+def _single_column_data(column: str, values: list) -> pl.DataFrame:
+    return pl.DataFrame({column: values}).with_row_index(ROW_ID)
 
 
 def test_leave_blank(dummy_dataset, fuzzy_checker: FuzzyChecker):
@@ -288,98 +236,82 @@ def test_leave_blank(dummy_dataset, fuzzy_checker: FuzzyChecker):
         }
     )[DATASETS.census.name][Keys.COLUMN_NOISE]["zipcode"][NOISE_TYPES.leave_blank.name]
 
-    data = dummy_dataset[["numbers"]]
-    noised_data, _ = NOISE_TYPES.leave_blank(data, config, RANDOMNESS0, "dataset", "numbers")
+    data = dummy_dataset.select(ROW_ID, "numbers")
+    noised_data = _noise(
+        NOISE_TYPES.leave_blank, data, config, RANDOMNESS0, "dataset", "numbers"
+    )
+    original = data["numbers"]
 
     # Calculate newly missing data, ie data that didn't come in as already missing
-    data = data.squeeze()
-    orig_non_missing_idx = data.index[(data.notna()) & (data != "")]
-    newly_missing_idx = noised_data.index[
-        (noised_data.index.isin(orig_non_missing_idx)) & (noised_data.isna())
-    ]
+    orig_non_missing = original.is_not_null()
+    newly_missing = orig_non_missing & noised_data.is_null()
 
     # Check for expected noise level
     expected_noise = config[Keys.CELL_PROBABILITY]
     fuzzy_checker.fuzzy_assert_proportion(
         name="leave_blank",
-        observed_numerator=len(newly_missing_idx),
-        observed_denominator=len(orig_non_missing_idx),
+        observed_numerator=newly_missing.sum(),
+        observed_denominator=orig_non_missing.sum(),
         target_proportion=expected_noise,
     )
 
     # Check that un-noised values are unchanged
-    not_noised_idx = noised_data.index[noised_data.notna()]
-    assert (data[not_noised_idx] == noised_data[not_noised_idx]).all()
+    not_noised = noised_data.is_not_null()
+    assert (original.filter(not_noised) == noised_data.filter(not_noised)).all()
 
 
 def test_choose_wrong_option(dummy_dataset, fuzzy_checker: FuzzyChecker):
     config = get_configuration()[DATASETS.census.name][Keys.COLUMN_NOISE]["state"][
         NOISE_TYPES.choose_wrong_option.name
     ]
-    data = dummy_dataset[["state"]]
-    noised_data, _ = NOISE_TYPES.choose_wrong_option(
-        data, config, RANDOMNESS0, "dataset", "state"
+    data = dummy_dataset.select(ROW_ID, "state")
+    noised_data = _noise(
+        NOISE_TYPES.choose_wrong_option, data, config, RANDOMNESS0, "dataset", "state"
     )
-    data = data.squeeze()
+    original = data["state"]
     # Check for expected noise level
     expected_noise = config[Keys.CELL_PROBABILITY]
     # todo: Update when choose_wrong_options uses exclusive resampling
-    # Get real expected noise to account for possibility of noising with original value
-    # Here we have a a possibility of choosing any of the 50 states for our categorical series fixture
-    actual_noise = (noised_data != data).sum()
-    original_empty_idx = data.index[data == ""]
-    noised_empty_idx = noised_data.index[noised_data == ""]
+    actual_noise = noised_data.ne_missing(original).sum()
     fuzzy_checker.fuzzy_assert_proportion(
         name="choose_wrong_option",
         observed_numerator=actual_noise,
-        observed_denominator=(len(data) - len(original_empty_idx)),
+        observed_denominator=original.is_not_null().sum(),
         target_proportion=expected_noise,
     )
-    pd.testing.assert_index_equal(original_empty_idx, noised_empty_idx)
+    assert (original.is_null() == noised_data.is_null()).all()
 
 
 def test_generate_copy_from_household_member(dummy_dataset, fuzzy_checker: FuzzyChecker):
     config = get_configuration()[DATASETS.census.name][Keys.COLUMN_NOISE]["age"][
         NOISE_TYPES.copy_from_household_member.name
     ]
-    data = dummy_dataset[["age", "copy_age"]]
-    noised_data, _ = NOISE_TYPES.copy_from_household_member(
-        data, config, RANDOMNESS0, "dataset", "age"
+    data = dummy_dataset.select(ROW_ID, "age", "copy_age")
+    noised_data = _noise(
+        NOISE_TYPES.copy_from_household_member, data, config, RANDOMNESS0, "dataset", "age"
     )
 
     # Check for expected noise level
     expected_noise = config[Keys.CELL_PROBABILITY]
-    original_missing_idx = data.index[data["age"].isnull()]
-    eligible_for_noise_idx = data.index.difference(original_missing_idx)
-    data = data["age"]
-    actual_noise = (noised_data[eligible_for_noise_idx] != data[eligible_for_noise_idx]).sum()
+    original = data["age"]
+    eligible = original.is_not_null()
+    was_noised = noised_data.ne_missing(original)
     fuzzy_checker.fuzzy_assert_proportion(
         name="generate_copy_from_household_member",
-        observed_numerator=actual_noise,
-        observed_denominator=len(eligible_for_noise_idx),
+        observed_numerator=(was_noised & eligible).sum(),
+        observed_denominator=eligible.sum(),
         target_proportion=expected_noise,
     )
 
     # Noised values should be the same as the copy column
-    was_noised_series = noised_data[eligible_for_noise_idx] != data[eligible_for_noise_idx]
-    noised_idx = was_noised_series[was_noised_series].index
-    assert (
-        dummy_dataset.loc[noised_idx, COPY_HOUSEHOLD_MEMBER_COLS["age"]]
-        == noised_data.loc[noised_idx]
-    ).all()
-    not_noised_idx = dummy_dataset.index.difference(noised_idx)
-    assert (
-        (dummy_dataset.loc[not_noised_idx, "age"] == noised_data.loc[not_noised_idx])
-        | (
-            dummy_dataset.loc[not_noised_idx, "age"].isnull()
-            & noised_data.loc[not_noised_idx].isnull()
-        )
-    ).all()
+    copy_column = data[COPY_HOUSEHOLD_MEMBER_COLS["age"]]
+    assert (copy_column.filter(was_noised) == noised_data.filter(was_noised)).all()
+    assert original.filter(~was_noised).equals(noised_data.filter(~was_noised))
 
 
 def test_swap_months_and_days(dummy_dataset, fuzzy_checker: FuzzyChecker):
     for col in ["event_date", "date_of_birth"]:
-        data = dummy_dataset[[col]]
+        data = dummy_dataset.select(ROW_ID, col)
         if col == "event_date":
             config = get_configuration()[DATASETS.ssa.name][Keys.COLUMN_NOISE][col][
                 NOISE_TYPES.swap_month_and_day.name
@@ -402,21 +334,29 @@ def test_swap_months_and_days(dummy_dataset, fuzzy_checker: FuzzyChecker):
                 NOISE_TYPES.swap_month_and_day.name
             ]
         expected_noise = config[Keys.CELL_PROBABILITY]
-        noised_data, _ = NOISE_TYPES.swap_month_and_day(
-            data, config, RANDOMNESS0, DATASETS.census.name, col
+        noised_data = _noise(
+            NOISE_TYPES.swap_month_and_day,
+            data,
+            config,
+            RANDOMNESS0,
+            DATASETS.census.name,
+            col,
         )
 
         # Confirm missing data remains missing
-        data = data.squeeze()
-        orig_missing = data.isna()
-        assert (noised_data[orig_missing].isna()).all()
+        original = data[col]
+        orig_missing = original.is_null()
+        assert noised_data.filter(orig_missing).is_null().all()
 
-        assert (data[~orig_missing].str[6:] == noised_data[~orig_missing].str[6:]).all()
-        actual_noise = (data[~orig_missing] != noised_data[~orig_missing]).sum()
+        original, noised_data = (
+            original.filter(~orig_missing),
+            noised_data.filter(~orig_missing),
+        )
+        assert (original.str.slice(6) == noised_data.str.slice(6)).all()
         fuzzy_checker.fuzzy_assert_proportion(
             name="swap_months_and_days",
-            observed_numerator=actual_noise,
-            observed_denominator=len(data[~orig_missing]),
+            observed_numerator=(original != noised_data).sum(),
+            observed_denominator=len(original),
             target_proportion=expected_noise,
         )
 
@@ -445,37 +385,40 @@ def test_write_wrong_zipcode_digits(dummy_dataset, fuzzy_checker: FuzzyChecker):
     # Get configuration values for each piece of 5 digit zipcode
     cell_probability = config[Keys.CELL_PROBABILITY]
     token_probability = config[Keys.ZIPCODE_DIGIT_PROBABILITIES]
-    data = dummy_dataset[["zipcode"]]
-    noised_data, _ = NOISE_TYPES.write_wrong_zipcode_digits(
-        data, config, RANDOMNESS0, "dataset", "zipcode"
+    data = dummy_dataset.select(ROW_ID, "zipcode")
+    noised_data = _noise(
+        NOISE_TYPES.write_wrong_zipcode_digits,
+        data,
+        config,
+        RANDOMNESS0,
+        "dataset",
+        "zipcode",
     )
 
     # Confirm missing data remains missing
-    data = data.squeeze()
-    orig_missing = data == ""
-    assert (noised_data[orig_missing] == "").all()
+    original = data["zipcode"]
+    orig_missing = original.is_null()
+    assert noised_data.filter(orig_missing).is_null().all()
+    original, noised_data = original.filter(~orig_missing), noised_data.filter(~orig_missing)
     # Check noise for each digits position matches expected noise
     for i in range(5):
         digit_prob = config["digit_probabilities"][i]
-        actual_noise = (data[~orig_missing].str[i] != noised_data[~orig_missing].str[i]).sum()
-        expected_noise = digit_prob * cell_probability
+        actual_noise = (original.str.slice(i, 1) != noised_data.str.slice(i, 1)).sum()
         fuzzy_checker.fuzzy_assert_proportion(
             name="write_wrong_zipcode_digits",
             observed_numerator=actual_noise,
-            observed_denominator=len(data[~orig_missing]),
-            target_proportion=expected_noise,
+            observed_denominator=len(original),
+            target_proportion=digit_prob * cell_probability,
         )
 
     # Validate whole column at once
-    actual_noise = (data[~orig_missing] != noised_data[~orig_missing]).sum()
     avg_probability_any_token_noised = 1 - math.prod([1 - p for p in token_probability])
     probability_not_noised = 1 - avg_probability_any_token_noised * cell_probability
-    exepected_noised = 1 - probability_not_noised
     fuzzy_checker.fuzzy_assert_proportion(
         name="write_wrong_zipcode_digits_series",
-        observed_numerator=actual_noise,
-        observed_denominator=len(data[~orig_missing]),
-        target_proportion=exepected_noised,
+        observed_numerator=(original != noised_data).sum(),
+        observed_denominator=len(original),
+        target_proportion=1 - probability_not_noised,
     )
 
 
@@ -486,39 +429,35 @@ def test_miswrite_ages_default_config(dummy_dataset, fuzzy_checker: FuzzyChecker
     config = get_configuration()[DATASETS.census.name][Keys.COLUMN_NOISE]["age"][
         NOISE_TYPES.misreport_age.name
     ]
-    data = dummy_dataset[["age"]]
-    noised_data, _ = NOISE_TYPES.misreport_age(data, config, RANDOMNESS0, "dataset", "age")
-    data = data.squeeze()
+    data = dummy_dataset.select(ROW_ID, "age")
+    noised_data = _noise(
+        NOISE_TYPES.misreport_age, data, config, RANDOMNESS0, "dataset", "age"
+    )
+    original = data["age"]
 
     # Check for expected noise level
-    not_missing_idx = data.index[data.notnull()]
+    not_missing = original.is_not_null()
     expected_noise = config[Keys.CELL_PROBABILITY]
-    actual_noise = (noised_data[not_missing_idx] != data[not_missing_idx]).sum()
     # NOTE: the expected noise calculated above does not account for the fact that
     # if a perturbed age ends up being the same as the original age, then 1 is subtracted.
     fuzzy_checker.fuzzy_assert_proportion(
         name="misreport_age",
-        observed_numerator=actual_noise,
-        observed_denominator=len(data[not_missing_idx]),
+        observed_numerator=(
+            noised_data.filter(not_missing) != original.filter(not_missing)
+        ).sum(),
+        observed_denominator=not_missing.sum(),
         target_proportion=expected_noise,
     )
 
     # Check that missing data remains missing
-    original_missing_idx = data.index[data == ""]
-    noised_missing_idx = noised_data.index[noised_data == ""]
-    pd.testing.assert_index_equal(original_missing_idx, noised_missing_idx)
+    assert (original.is_null() == noised_data.is_null()).all()
 
     # Check that there are no negative ages generated
-    assert noised_data[not_missing_idx].astype(int).min() >= 0
+    assert noised_data.drop_nulls().cast(pl.Int64).min() >= 0
 
 
-def test_miswrite_ages_uniform_probabilities(fuzzy_checker: FuzzyChecker):
-    """Test that a list of perturbations passed in results in uniform probabilities"""
-    num_rows = 100_000
-    original_age = 25
-    perturbations = [-2, -1, 1]
-
-    config = get_configuration(
+def _misreport_age_config(perturbations) -> dict:
+    return get_configuration(
         {
             DATASETS.census.name: {
                 Keys.COLUMN_NOISE: {
@@ -533,16 +472,25 @@ def test_miswrite_ages_uniform_probabilities(fuzzy_checker: FuzzyChecker):
         },
     )[DATASETS.census.name][Keys.COLUMN_NOISE]["age"][NOISE_TYPES.misreport_age.name]
 
-    data = pd.Series([str(original_age)] * num_rows, name="age")
-    df = pd.DataFrame({"age": data})
-    noised_data, _ = NOISE_TYPES.misreport_age(df, config, RANDOMNESS0, "dataset", "age")
+
+def test_miswrite_ages_uniform_probabilities(fuzzy_checker: FuzzyChecker):
+    """Test that a list of perturbations passed in results in uniform probabilities"""
+    num_rows = 100_000
+    original_age = 25
+    perturbations = [-2, -1, 1]
+    config = _misreport_age_config(perturbations)
+
+    data = _single_column_data("age", [str(original_age)] * num_rows)
+    noised_data = _noise(
+        NOISE_TYPES.misreport_age, data, config, RANDOMNESS0, "dataset", "age"
+    )
     expected_noise = 1 / len(perturbations)
     for perturbation in perturbations:
-        actual_noise = (noised_data.astype(int) - original_age == perturbation).sum()
+        actual_noise = (noised_data.cast(pl.Int64) - original_age == perturbation).sum()
         fuzzy_checker.fuzzy_assert_proportion(
             name="misreport_age_uniform_probabilities",
             observed_numerator=actual_noise,
-            observed_denominator=len(data),
+            observed_denominator=num_rows,
             target_proportion=expected_noise,
         )
 
@@ -552,32 +500,18 @@ def test_miswrite_ages_provided_probabilities(fuzzy_checker: FuzzyChecker):
     num_rows = 100_000
     original_age = 25
     perturbations = {-1: 0.1, 1: 0.9}
+    config = _misreport_age_config(perturbations)
 
-    config = get_configuration(
-        {
-            DATASETS.census.name: {
-                Keys.COLUMN_NOISE: {
-                    "age": {
-                        NOISE_TYPES.misreport_age.name: {
-                            Keys.CELL_PROBABILITY: 1,
-                            Keys.POSSIBLE_AGE_DIFFERENCES: perturbations,
-                        },
-                    },
-                },
-            },
-        },
-    )[DATASETS.census.name][Keys.COLUMN_NOISE]["age"][NOISE_TYPES.misreport_age.name]
-
-    data = pd.Series([str(original_age)] * num_rows, name="age")
-    df = pd.DataFrame({"age": data})
-    noised_data, _ = NOISE_TYPES.misreport_age(df, config, RANDOMNESS0, "dataset", "age")
-    for perturbation in perturbations:
-        expected_noise = perturbations[perturbation]
-        actual_noise = (noised_data.astype(int) - original_age == perturbation).sum()
+    data = _single_column_data("age", [str(original_age)] * num_rows)
+    noised_data = _noise(
+        NOISE_TYPES.misreport_age, data, config, RANDOMNESS0, "dataset", "age"
+    )
+    for perturbation, expected_noise in perturbations.items():
+        actual_noise = (noised_data.cast(pl.Int64) - original_age == perturbation).sum()
         fuzzy_checker.fuzzy_assert_proportion(
             name="misreport_age_provided_probabilities",
             observed_numerator=actual_noise,
-            observed_denominator=len(data),
+            observed_denominator=num_rows,
             target_proportion=expected_noise,
         )
 
@@ -588,67 +522,25 @@ def test_miswrite_ages_handles_perturbation_to_same_age():
     perturbed -2 becomes -1. But we cannot have negative so we flip the sign to +1.
     But that's the same as the original age and so should become 1-1=0.
     """
-    num_rows = 100
-    age = 1.0
-    perturbations = [-2]  # This will cause -1 which will be flipped to +1
-
-    config = get_configuration(
-        {
-            DATASETS.census.name: {
-                Keys.COLUMN_NOISE: {
-                    "age": {
-                        NOISE_TYPES.misreport_age.name: {
-                            Keys.CELL_PROBABILITY: 1,
-                            Keys.POSSIBLE_AGE_DIFFERENCES: perturbations,
-                        },
-                    },
-                },
-            },
-        },
-    )[DATASETS.census.name][Keys.COLUMN_NOISE]["age"][NOISE_TYPES.misreport_age.name]
-
-    data = pd.Series([age] * num_rows, name="age")
-    df = pd.DataFrame({"age": data})
-    noised_data, _ = NOISE_TYPES.misreport_age(df, config, RANDOMNESS0, "dataset", "age")
-
-    assert (noised_data == 0).all()
+    config = _misreport_age_config([-2])  # This will cause -1 which will be flipped to +1
+    data = _single_column_data("age", ["1"] * 100)
+    noised_data = _noise(
+        NOISE_TYPES.misreport_age, data, config, RANDOMNESS0, "dataset", "age"
+    )
+    assert (noised_data == "0").all()
 
 
 def test_miswrite_ages_flips_negative_to_positive():
     """Test that any ages perturbed to <0 are reflected to positive values"""
-    num_rows = 100
-    age = 3.0
-    perturbations = [-7]  # This will cause -4 and should flip to +4
-
-    config = get_configuration(
-        {
-            DATASETS.census.name: {
-                Keys.COLUMN_NOISE: {
-                    "age": {
-                        NOISE_TYPES.misreport_age.name: {
-                            Keys.CELL_PROBABILITY: 1,
-                            Keys.POSSIBLE_AGE_DIFFERENCES: perturbations,
-                        },
-                    },
-                },
-            },
-        },
-    )[DATASETS.census.name][Keys.COLUMN_NOISE]["age"][NOISE_TYPES.misreport_age.name]
-
-    data = pd.Series([age] * num_rows, name="age")
-    df = pd.DataFrame({"age": data})
-    noised_data, _ = NOISE_TYPES.misreport_age(df, config, RANDOMNESS0, "dataset", "age")
-
-    assert (noised_data == 4).all()
+    config = _misreport_age_config([-7])  # This will cause -4 and should flip to +4
+    data = _single_column_data("age", ["3"] * 100)
+    noised_data = _noise(
+        NOISE_TYPES.misreport_age, data, config, RANDOMNESS0, "dataset", "age"
+    )
+    assert (noised_data == "4").all()
 
 
-@pytest.mark.slow
-def test_write_wrong_digits_robust(dummy_dataset, fuzzy_checker: FuzzyChecker):
-    """
-    Validates that only numeric characters are noised in a series at a provided noise level.
-    """
-    # This test is pretty slow because of the number of times we have to iterate through the series
-    # so I have marked it as slow - albrja
+def _write_wrong_digits_config() -> dict:
     config = get_configuration()
     config.update(
         {
@@ -664,176 +556,89 @@ def test_write_wrong_digits_robust(dummy_dataset, fuzzy_checker: FuzzyChecker):
             },
         }
     )
-    config = config[DATASETS.census.name][Keys.COLUMN_NOISE]["street_number"][
+    return config[DATASETS.census.name][Keys.COLUMN_NOISE]["street_number"][
         NOISE_TYPES.write_wrong_digits.name
     ]
+
+
+def test_write_wrong_digits_robust(dummy_dataset, fuzzy_checker: FuzzyChecker):
+    """
+    Validates that only numeric characters are noised in a series at a provided noise level.
+    """
+    config = _write_wrong_digits_config()
     p_row_noise = config[Keys.CELL_PROBABILITY]
     p_token_noise = config[Keys.TOKEN_PROBABILITY]
-    data = dummy_dataset[["street_number"]]
+    data = dummy_dataset.select(ROW_ID, "street_number")
     # Note: I changed this column from string_series to street number. It has several string formats
     # containing both numeric and alphabetically string characters.
-    noised_data, _ = NOISE_TYPES.write_wrong_digits(
-        data, config, RANDOMNESS0, "dataset", "street_number"
+    noised_data = _noise(
+        NOISE_TYPES.write_wrong_digits, data, config, RANDOMNESS0, "dataset", "street_number"
     )
-
-    # Get masks for helper groups, each string in categorical string purpose is to mimic possible string types
-    data = data["street_number"]
-    empty_str = data == ""
-    ambig_str = data.str.len() == 3
-    unit_number = data == "Unit 1A"
-    id_number = data == "1234"
-    alt_str = data == "a1b2c3"
-    income = data == "100000.00"
-    date_of_birth = data == "12/31/2020"
-    ssn = data == "123-45-6789"
+    original = data["street_number"]
     expected_noise = p_row_noise * p_token_noise
 
-    # Check empty strings havent changed
-    assert (noised_data[empty_str] == "").all()
+    # Check missing values haven't changed
+    assert (original.is_null() == noised_data.is_null()).all()
     # Assert string length doesn't change after noising
-    assert (data.str.len() == noised_data.str.len()).all()
+    assert original.str.len_chars().equals(noised_data.str.len_chars())
 
-    for i in range(3):  # "fo1", "fo2", "fo3"
-        if i == 2:
-            actual_noise = (data[ambig_str].str[i] != noised_data[ambig_str].str[i]).sum()
-            fuzzy_checker.fuzzy_assert_proportion(
-                name="write_wrong_digits_robust_ambig_str",
-                observed_numerator=actual_noise,
-                observed_denominator=len(data[ambig_str]),
-                target_proportion=expected_noise,
-            )
-        else:
-            assert (data[ambig_str].str[i] == noised_data[ambig_str].str[i]).all()
-
-    for i in range(4):  # "1234"
-        actual_noise = (data[id_number].str[i] != noised_data[id_number].str[i]).sum()
-        fuzzy_checker.fuzzy_assert_proportion(
-            name="write_wrong_digits_robust_id_number",
-            observed_numerator=actual_noise,
-            observed_denominator=len(data[id_number]),
-            target_proportion=expected_noise,
-        )
-        assert (noised_data[id_number].str[i].str.isdigit()).all()
-
-    for i in range(6):  # "a1b2c3"
-        if i % 2 == 0:
-            assert (data[alt_str].str[i] == noised_data[alt_str].str[i]).all()
-        else:
-            actual_noise = (data[alt_str].str[i] != noised_data[alt_str].str[i]).sum()
-            fuzzy_checker.fuzzy_assert_proportion(
-                name="write_wrong_digits_robust_alt_str",
-                observed_numerator=actual_noise,
-                observed_denominator=len(data[alt_str]),
-                target_proportion=expected_noise,
-            )
-            assert (noised_data[alt_str].str[i].str.isdigit()).all()
-
-    for i in range(7):  # "Unit 1A"
-        if i == 5:
-            actual_noise = (data[unit_number].str[i] != noised_data[unit_number].str[i]).sum()
-            fuzzy_checker.fuzzy_assert_proportion(
-                name="write_wrong_digits_robust_unit_number",
-                observed_numerator=actual_noise,
-                observed_denominator=len(data[unit_number]),
-                target_proportion=expected_noise,
-            )
-            assert (noised_data[unit_number].str[i].str.isdigit()).all()
-        else:
-            assert (data[unit_number].str[i] == noised_data[unit_number].str[i]).all()
-
-    for i in range(9):  # "100000.00"
-        if i == 6:
-            assert (data[income].str[i] == noised_data[income].str[i]).all()
-        else:
-            actual_noise = (data[income].str[i] != noised_data[income].str[i]).sum()
-            fuzzy_checker.fuzzy_assert_proportion(
-                name="write_wrong_digits_robust_income",
-                observed_numerator=actual_noise,
-                observed_denominator=len(data[income]),
-                target_proportion=expected_noise,
-            )
-            assert (noised_data[income].str[i].str.isdigit()).all()
-
-    for i in range(10):  # "12/31/2020"
-        if i in [2, 5]:
-            assert (data[date_of_birth].str[i] == noised_data[date_of_birth].str[i]).all()
-        else:
-            actual_noise = (
-                data[date_of_birth].str[i] != noised_data[date_of_birth].str[i]
-            ).sum()
-            fuzzy_checker.fuzzy_assert_proportion(
-                name="write_wrong_digits_robust_date_of_birth",
-                observed_numerator=actual_noise,
-                observed_denominator=len(data[date_of_birth]),
-                target_proportion=expected_noise,
-            )
-            assert (noised_data[date_of_birth].str[i].str.isdigit()).all()
-
-    for i in range(11):  # "123-45-6789"
-        if i in [3, 6]:
-            assert (data[ssn].str[i] == noised_data[ssn].str[i]).all()
-        else:
-            actual_noise = (data[ssn].str[i] != noised_data[ssn].str[i]).sum()
-            fuzzy_checker.fuzzy_assert_proportion(
-                name="write_wrong_digits_robust_ssn",
-                observed_numerator=actual_noise,
-                observed_denominator=len(data[ssn]),
-                target_proportion=expected_noise,
-            )
-            assert (noised_data[ssn].str[i].str.isdigit()).all()
+    # For each example string, the character positions that are digits (and so can be noised)
+    examples = {
+        "fo1": [2],
+        "fo2": [2],
+        "fo3": [2],
+        "1234": [0, 1, 2, 3],
+        "a1b2c3": [1, 3, 5],
+        "Unit 1A": [5],
+        "100000.00": [0, 1, 2, 3, 4, 5, 7, 8],
+        "12/31/2020": [0, 1, 3, 4, 6, 7, 8, 9],
+        "123-45-6789": [0, 1, 2, 4, 5, 7, 8, 9, 10],
+    }
+    for example, digit_positions in examples.items():
+        is_example = original == example
+        example_original = original.filter(is_example)
+        example_noised = noised_data.filter(is_example)
+        for i in range(len(example)):
+            original_char = example_original.str.slice(i, 1)
+            noised_char = example_noised.str.slice(i, 1)
+            if i in digit_positions:
+                fuzzy_checker.fuzzy_assert_proportion(
+                    name=f"write_wrong_digits_robust_{example}",
+                    observed_numerator=(original_char != noised_char).sum(),
+                    observed_denominator=len(example_original),
+                    target_proportion=expected_noise,
+                )
+                assert noised_char.str.contains(r"^[0-9]$").all()
+            else:
+                assert (original_char == noised_char).all()
 
 
 def test_write_wrong_digits(dummy_dataset, fuzzy_checker: FuzzyChecker):
     # This is a quicker (less robust) version of the test above.
     # It only checks that numeric characters are noised at the correct level as
     # a sanity check our noise is of the right magnitude
-    config = get_configuration()
-    config.update(
-        {
-            DATASETS.census.name: {
-                Keys.COLUMN_NOISE: {
-                    "street_number": {
-                        NOISE_TYPES.write_wrong_digits.name: {
-                            Keys.CELL_PROBABILITY: 0.4,
-                            Keys.TOKEN_PROBABILITY: 0.5,
-                        },
-                    },
-                },
-            },
-        }
-    )
-    config = config[DATASETS.census.name][Keys.COLUMN_NOISE]["street_number"][
-        NOISE_TYPES.write_wrong_digits.name
-    ]
+    config = _write_wrong_digits_config()
     expected_cell_noise = config[Keys.CELL_PROBABILITY]
     expected_token_noise = config[Keys.TOKEN_PROBABILITY]
-    data = dummy_dataset[["street_number"]]
-    # Note: I changed this column from string_series to street number. It has several string formats
-    # containing both numeric and alphabetically string characters.
-    noised_data, _ = NOISE_TYPES.write_wrong_digits(
-        data, config, RANDOMNESS0, "dataset", "street_number"
+    data = dummy_dataset.select(ROW_ID, "street_number")
+    noised_data = _noise(
+        NOISE_TYPES.write_wrong_digits, data, config, RANDOMNESS0, "dataset", "street_number"
     )
 
     # Validate we do not change any missing data
-    data = data.squeeze()
-    missing_mask = data == ""
-    assert (noised_data[missing_mask] == "").all()
+    original = data["street_number"]
+    missing = original.is_null()
+    assert noised_data.filter(missing).is_null().all()
 
     # Check expected noise level
-    check_original = data[~missing_mask]
-    string_series = pd.Series(STRING_LIST)
-    # Calculate average number of digits per string in the data
-    # Replace no numeric values with nothing
-    digits_per_string = string_series.str.replace(r"[^\d]", "", regex=True).str.len()
-    avg_probability_any_token_noised = (
-        1 - (1 - expected_token_noise) ** digits_per_string
-    ).mean()
-    check_noised = noised_data[~missing_mask]
-    actual_noise = (check_original != check_noised).sum()
+    digits_per_string = [sum(c.isdigit() for c in s) for s in STRING_LIST]
+    avg_probability_any_token_noised = sum(
+        1 - (1 - expected_token_noise) ** n for n in digits_per_string
+    ) / len(digits_per_string)
     fuzzy_checker.fuzzy_assert_proportion(
         name="write_wrong_digits",
-        observed_numerator=actual_noise,
-        observed_denominator=len(check_original),
+        observed_numerator=(original.filter(~missing) != noised_data.filter(~missing)).sum(),
+        observed_denominator=(~missing).sum(),
         target_proportion=expected_cell_noise * avg_probability_any_token_noised,
     )
 
@@ -843,53 +648,51 @@ def test_use_nickname(dummy_dataset, fuzzy_checker: FuzzyChecker):
         NOISE_TYPES.use_nickname.name
     ]
     expected_noise = config[Keys.CELL_PROBABILITY]
-    data = dummy_dataset[["first_name"]]
-    noised_data, _ = NOISE_TYPES.use_nickname(
-        data, config, RANDOMNESS0, "dataset", "first_name"
+    data = dummy_dataset.select(ROW_ID, "first_name")
+    noised_data = _noise(
+        NOISE_TYPES.use_nickname, data, config, RANDOMNESS0, "dataset", "first_name"
     )
-    data = data.squeeze()
+    original = data["first_name"]
 
     # Validate missing stays missing
-    orig_missing = data.isna()
-    assert (noised_data[orig_missing].isna()).all()
+    orig_missing = original.is_null()
+    assert noised_data.filter(orig_missing).is_null().all()
     # Validate noise level
-    actual_noise = (noised_data[~orig_missing] != data[~orig_missing]).sum()
     fuzzy_checker.fuzzy_assert_proportion(
         name="use_nickname",
-        observed_numerator=actual_noise,
-        observed_denominator=len(data[~orig_missing]),
+        observed_numerator=(
+            noised_data.filter(~orig_missing) != original.filter(~orig_missing)
+        ).sum(),
+        observed_denominator=(~orig_missing).sum(),
         target_proportion=expected_noise,
     )
 
     # Validation for nicknames
-    from pseudopeople.noise_scaling import load_nicknames_data
-
-    nicknames = load_nicknames_data()
-    names_list = pd.Series(
-        nicknames.apply(lambda row: row.dropna().tolist(), axis=1), index=nicknames.index
-    )
-    for real_name in data.dropna().unique():
-        # Validates names that are not nickname eligible do not not get noised
-        if real_name not in names_list.index:
-            assert (data.loc[data == real_name] == noised_data[data == real_name]).all()
+    nicknames = {
+        row[TOKEN]: row["options"] for row in load_nicknames_data().iter_rows(named=True)
+    }
+    for real_name in original.drop_nulls().unique():
+        is_name = original == real_name
+        noised_name = noised_data.filter(is_name)
+        if real_name not in nicknames:
+            # Validates names that are not nickname eligible do not not get noised
+            assert (noised_name == real_name).all()
         else:
-            real_name_idx = data.index[data == real_name]
             # Verify options chosen are valid nicknames for original names that were noised
-            assert set(noised_data.loc[real_name_idx].dropna()).issubset(
-                set(names_list.loc[real_name] + [real_name])
+            assert set(noised_name.drop_nulls()).issubset(
+                set(nicknames[real_name] + [real_name])
             )
             # Validate we choose the nicknames for each name randomly (equally)
-            chosen_nicknames = noised_data.loc[
-                real_name_idx.difference(noised_data.index[noised_data == real_name])
-            ]
-            chosen_nickname_counts = pd.Series(chosen_nicknames.value_counts())
-            expected_name_proportion = 1 / len(names_list.loc[real_name])
-            for nickname in chosen_nickname_counts.index:
+            chosen_nickname_counts = noised_name.filter(
+                noised_name != real_name
+            ).value_counts()
+            total = chosen_nickname_counts["count"].sum()
+            for nickname, count in chosen_nickname_counts.iter_rows():
                 fuzzy_checker.fuzzy_assert_proportion(
                     name="use_nickname_proportion",
-                    observed_numerator=chosen_nickname_counts.loc[nickname],
-                    observed_denominator=chosen_nickname_counts.sum(),
-                    target_proportion=expected_name_proportion,
+                    observed_numerator=count,
+                    observed_denominator=total,
+                    target_proportion=1 / len(nicknames[real_name]),
                     name_additional=f"for nickname: {nickname} of real name: {real_name}",
                 )
 
@@ -915,61 +718,84 @@ def test_use_fake_name(dummy_dataset, fuzzy_checker: FuzzyChecker):
             },
         }
     )
-    first_name_config = config[DATASETS.census.name][Keys.COLUMN_NOISE]["first_name"][
-        NOISE_TYPES.use_fake_name.name
-    ]
-    last_name_config = config[DATASETS.census.name][Keys.COLUMN_NOISE]["last_name"][
-        NOISE_TYPES.use_fake_name.name
-    ]
 
-    # For this test, using the dummy_dataset fixture the "string_series" column will be used as both names columns
-    # This will help demonstrate that the additional key is working correctly
-    first_name_data = dummy_dataset[["first_name"]]
-    last_name_data = dummy_dataset[["last_name"]]
-    noised_first_names, _ = NOISE_TYPES.use_fake_name(
-        first_name_data, first_name_config, RANDOMNESS0, "dataset", "first_name"
-    )
-    noised_last_names, _ = NOISE_TYPES.use_fake_name(
-        last_name_data, last_name_config, RANDOMNESS0, "dataset", "last_name"
-    )
-    first_name_data = first_name_data.squeeze()
-    last_name_data = last_name_data.squeeze()
+    for column, fake_names in [
+        ("first_name", fake_first_names),
+        ("last_name", fake_last_names),
+    ]:
+        column_config = config[DATASETS.census.name][Keys.COLUMN_NOISE][column][
+            NOISE_TYPES.use_fake_name.name
+        ]
+        data = dummy_dataset.select(ROW_ID, column)
+        noised = _noise(
+            NOISE_TYPES.use_fake_name, data, column_config, RANDOMNESS0, "dataset", column
+        )
+        original = data[column]
 
-    # Check missing are unchanged
-    orig_missing = first_name_data == ""
-    assert (first_name_data[orig_missing] == noised_first_names[orig_missing]).all()
-    assert (last_name_data[orig_missing] == noised_last_names[orig_missing]).all()
-    # todo: equal across fake values
-    # Check noised values
-    actual_first_name_noise = (
-        first_name_data[~orig_missing] != noised_first_names[~orig_missing]
-    ).sum()
-    expected_first_name_noise = first_name_config[Keys.CELL_PROBABILITY]
-    fuzzy_checker.fuzzy_assert_proportion(
-        name="use_fake_name_first_name",
-        observed_numerator=actual_first_name_noise,
-        observed_denominator=len(first_name_data[~orig_missing]),
-        target_proportion=expected_first_name_noise,
+        # Check missing are unchanged
+        orig_missing = original.is_null()
+        assert noised.filter(orig_missing).is_null().all()
+        # Check noised values
+        changed = noised.ne_missing(original)
+        fuzzy_checker.fuzzy_assert_proportion(
+            name=f"use_fake_name_{column}",
+            observed_numerator=changed.sum(),
+            observed_denominator=(~orig_missing).sum(),
+            target_proportion=column_config[Keys.CELL_PROBABILITY],
+        )
+        assert noised.filter(changed).is_in(fake_names).all()
+
+
+def _number_of_tokens_per_string(tokens, strings) -> list[int]:
+    """For each of strings, the total number of (overlapping) occurrences of tokens in it."""
+    return [sum(_occurrences(str(s), str(token)) for token in tokens) for s in strings]
+
+
+# https://stackoverflow.com/a/2970542/
+def _occurrences(string, sub):
+    count = start = 0
+    while True:
+        start = string.find(sub, start) + 1
+        if start > 0:
+            count += 1
+        else:
+            return count
+
+
+def _average_probability_any_token_noised(tokens, strings, token_probability) -> float:
+    tokens_per_string = _number_of_tokens_per_string(tokens, strings)
+    return sum(1 - (1 - token_probability) ** n for n in tokens_per_string) / len(
+        tokens_per_string
     )
 
-    actual_last_name_noise = (
-        last_name_data[~orig_missing] != noised_last_names[~orig_missing]
-    ).sum()
-    expected_last_name_noise = last_name_config[Keys.CELL_PROBABILITY]
-    fuzzy_checker.fuzzy_assert_proportion(
-        name="use_fake_name_last_name",
-        observed_numerator=actual_last_name_noise,
-        observed_denominator=len(last_name_data[~orig_missing]),
-        target_proportion=expected_last_name_noise,
-    )
 
-    # Get raw fake names lists to check noised values
-    fake_first = fake_first_names
-    fake_last = fake_last_names
-    assert (
-        noised_first_names.loc[noised_first_names != first_name_data].isin(fake_first).all()
+EQUALLY_LIKELY_VALUES = {
+    "first_name": FIRST_NAMES,
+    "last_name": LAST_NAMES,
+    "characters": CHARACTERS_LIST,
+    "numbers": [str(i) for i in INTEGERS_LIST],
+    "phonetic_stress_test": PHONETIC_STRESS_TEST_LIST,
+    "ocr_stress_test": OCR_STRESS_TEST_LIST,
+}
+
+
+def _token_noise_config(column: str, noise_type, cell_probability, token_probability):
+    config = get_configuration()
+    config.update(
+        {
+            DATASETS.census.name: {
+                Keys.COLUMN_NOISE: {
+                    column: {
+                        noise_type.name: {
+                            Keys.CELL_PROBABILITY: cell_probability,
+                            Keys.TOKEN_PROBABILITY: token_probability,
+                        },
+                    }
+                },
+            },
+        }
     )
-    assert noised_last_names.loc[noised_last_names != last_name_data].isin(fake_last).all()
+    return config[DATASETS.census.name][Keys.COLUMN_NOISE][column][noise_type.name]
 
 
 @pytest.mark.parametrize(
@@ -983,92 +809,44 @@ def test_use_fake_name(dummy_dataset, fuzzy_checker: FuzzyChecker):
     ],
 )
 def test_generate_phonetic_errors(dummy_dataset, column, fuzzy_checker: FuzzyChecker):
-    data = dummy_dataset[[column]]
-
-    config = get_configuration()
-    config.update(
-        {
-            DATASETS.census.name: {
-                Keys.COLUMN_NOISE: {
-                    column: {
-                        NOISE_TYPES.make_phonetic_errors.name: {
-                            Keys.CELL_PROBABILITY: 0.1,
-                            Keys.TOKEN_PROBABILITY: 0.5,
-                        },
-                    }
-                },
-            },
-        }
+    data = dummy_dataset.select(ROW_ID, column)
+    config = _token_noise_config(column, NOISE_TYPES.make_phonetic_errors, 0.1, 0.5)
+    noised_data = _noise(
+        NOISE_TYPES.make_phonetic_errors, data, config, RANDOMNESS0, "dataset", column
     )
-    # Get node
-    config = config[DATASETS.census.name][Keys.COLUMN_NOISE][column][
-        NOISE_TYPES.make_phonetic_errors.name
-    ]
-    noised_data, _ = NOISE_TYPES.make_phonetic_errors(
-        data, config, RANDOMNESS0, "dataset", column
-    )
-    data = data.squeeze()
+    original = data[column]
 
     # Validate we do not change any missing data
-    missing_mask = data == ""
-    assert (noised_data[missing_mask] == "").all()
+    missing = original.is_null()
+    assert noised_data.filter(missing).is_null().all()
 
     # Check expected noise level
-    cell_probability = config[Keys.CELL_PROBABILITY]
-    token_probability = config[Keys.TOKEN_PROBABILITY]
-    check_original = data[~missing_mask]
-    check_noised = noised_data[~missing_mask]
-    actual_noise = (check_original != check_noised).sum()
-
-    if column == "first_name":
-        equally_likely_values = pd.Series(FIRST_NAMES)
-    elif column == "last_name":
-        equally_likely_values = pd.Series(LAST_NAMES)
-    elif column == "characters":
-        equally_likely_values = pd.Series(CHARACTERS_LIST)
-    elif column == "numbers":
-        equally_likely_values = pd.Series(INTEGERS_LIST).astype(str)
-    elif column == "phonetic_stress_test":
-        equally_likely_values = pd.Series(PHONETIC_STRESS_TEST_LIST)
-
-    original_phonetic_tokens = pd.Series(load_phonetic_errors().index)
-    # Calculate average number of tokens per string in the data
-    tokens_per_string = number_of_tokens_per_string(
-        original_phonetic_tokens, equally_likely_values
+    avg_probability_any_token_noised = _average_probability_any_token_noised(
+        load_phonetic_errors()[TOKEN],
+        EQUALLY_LIKELY_VALUES[column],
+        config[Keys.TOKEN_PROBABILITY],
     )
-    avg_probability_any_token_noised = (
-        1 - (1 - token_probability) ** tokens_per_string
-    ).mean()
     fuzzy_checker.fuzzy_assert_proportion(
         name="generate_phonetic_errors",
-        observed_numerator=actual_noise,
-        observed_denominator=len(check_original),
-        target_proportion=cell_probability * avg_probability_any_token_noised,
+        observed_numerator=(original.filter(~missing) != noised_data.filter(~missing)).sum(),
+        observed_denominator=(~missing).sum(),
+        target_proportion=config[Keys.CELL_PROBABILITY] * avg_probability_any_token_noised,
     )
 
 
-@pytest.mark.parametrize(
-    "pair",
-    PHONETIC_STRESS_TEST_PATHWAYS.items(),
-)
-def test_phonetic_error_values(pair, fuzzy_checker: FuzzyChecker):
-    string, pathways = pair
-
-    data = pd.Series([string] * 100_000, name="column")
+def _check_pathways(string, pathways, noise_type, fuzzy_checker, name):
+    num_rows = 100_000
     cell_probability = 0.9
     token_probability = 0.3
     config = {
         Keys.CELL_PROBABILITY: cell_probability,
         Keys.TOKEN_PROBABILITY: token_probability,
     }
-    df = pd.DataFrame({"column": data})
-    noised_data, _ = NOISE_TYPES.make_phonetic_errors(
-        df, config, RANDOMNESS0, "dataset", "column"
-    )
+    data = _single_column_data("column", [string] * num_rows)
+    noised_data = _noise(noise_type, data, config, RANDOMNESS0, "dataset", "column")
 
-    assert noised_data.isin(
-        pathways.keys()
-    ).all(), f"Unexpected results for {string}: {set(noised_data) - set(pathways.keys())}"
+    unexpected = set(noised_data) - set(pathways.keys())
+    assert not unexpected, f"Unexpected results for {string}: {unexpected}"
     for result, (num_noised, num_not_noised) in pathways.items():
         pathway_probability = (
             token_probability**num_noised * (1 - token_probability) ** num_not_noised
@@ -1079,12 +857,27 @@ def test_phonetic_error_values(pair, fuzzy_checker: FuzzyChecker):
             probability += 1 - cell_probability
 
         fuzzy_checker.fuzzy_assert_proportion(
-            name="test_phonetic_error_values",
+            name=name,
             observed_numerator=(noised_data == result).sum(),
-            observed_denominator=len(data),
+            observed_denominator=num_rows,
             target_proportion=probability,
             name_additional=f"result {result} from string {string}",
         )
+
+
+@pytest.mark.parametrize(
+    "pair",
+    PHONETIC_STRESS_TEST_PATHWAYS.items(),
+)
+def test_phonetic_error_values(pair, fuzzy_checker: FuzzyChecker):
+    string, pathways = pair
+    _check_pathways(
+        string,
+        pathways,
+        NOISE_TYPES.make_phonetic_errors,
+        fuzzy_checker,
+        "test_phonetic_error_values",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1098,63 +891,28 @@ def test_phonetic_error_values(pair, fuzzy_checker: FuzzyChecker):
     ],
 )
 def test_generate_ocr_errors(dummy_dataset, column, fuzzy_checker: FuzzyChecker):
-    config = get_configuration()
-    config.update(
-        {
-            DATASETS.census.name: {
-                Keys.COLUMN_NOISE: {
-                    column: {
-                        NOISE_TYPES.make_ocr_errors.name: {
-                            Keys.CELL_PROBABILITY: 0.1,
-                            Keys.TOKEN_PROBABILITY: 0.1,
-                        },
-                    }
-                },
-            },
-        }
+    config = _token_noise_config(column, NOISE_TYPES.make_ocr_errors, 0.1, 0.1)
+    data = dummy_dataset.select(ROW_ID, column)
+    noised_data = _noise(
+        NOISE_TYPES.make_ocr_errors, data, config, RANDOMNESS0, "dataset", column
     )
-    # Get node
-    config = config[DATASETS.census.name][Keys.COLUMN_NOISE][column][
-        NOISE_TYPES.make_ocr_errors.name
-    ]
-    data = dummy_dataset[[column]]
-    noised_data, _ = NOISE_TYPES.make_ocr_errors(data, config, RANDOMNESS0, "dataset", column)
-    data = data.squeeze()
+    original = data[column]
 
     # Validate we do not change any missing data
-    missing_mask = data == ""
-    assert (data[missing_mask] == noised_data[missing_mask]).all()
+    missing = original.is_null()
+    assert noised_data.filter(missing).is_null().all()
 
-    # Check expected noise level
-    token_probability = config[Keys.TOKEN_PROBABILITY]
-    cell_probability = config[Keys.CELL_PROBABILITY]
-    # We need to calculate the expected noise. We need to get the average number of tokens per string
-    # that can be noised since not all tokens can be noised for OCR errors.
-    if column == "first_name":
-        equally_likely_values = pd.Series(FIRST_NAMES)
-    elif column == "last_name":
-        equally_likely_values = pd.Series(LAST_NAMES)
-    elif column == "characters":
-        equally_likely_values = pd.Series(CHARACTERS_LIST)
-    elif column == "numbers":
-        equally_likely_values = pd.Series(INTEGERS_LIST).astype(str)
-    elif column == "ocr_stress_test":
-        equally_likely_values = pd.Series(OCR_STRESS_TEST_LIST)
-
-    ocr_tokens = pd.Series(load_ocr_errors().index)
-    tokens_per_string = number_of_tokens_per_string(ocr_tokens, equally_likely_values)
-    avg_probability_any_token_noised = (
-        1 - (1 - token_probability) ** tokens_per_string
-    ).mean()
-    check_original = data[~missing_mask]
-    check_noised = noised_data[~missing_mask]
-    expected_proportion = cell_probability * avg_probability_any_token_noised
-    actual_noise = (check_original != check_noised).sum()
+    # Check expected noise level. Not all tokens can be noised for OCR errors.
+    avg_probability_any_token_noised = _average_probability_any_token_noised(
+        load_ocr_errors()[TOKEN],
+        EQUALLY_LIKELY_VALUES[column],
+        config[Keys.TOKEN_PROBABILITY],
+    )
     fuzzy_checker.fuzzy_assert_proportion(
         name="generate_ocr_errors",
-        observed_numerator=actual_noise,
-        observed_denominator=len(check_original),
-        target_proportion=expected_proportion,
+        observed_numerator=(original.filter(~missing) != noised_data.filter(~missing)).sum(),
+        observed_denominator=(~missing).sum(),
+        target_proportion=config[Keys.CELL_PROBABILITY] * avg_probability_any_token_noised,
     )
 
 
@@ -1164,36 +922,13 @@ def test_generate_ocr_errors(dummy_dataset, column, fuzzy_checker: FuzzyChecker)
 )
 def test_ocr_replacement_values(pair, fuzzy_checker: FuzzyChecker):
     string, pathways = pair
-
-    data = pd.Series([string] * 100_000, name="column")
-    cell_probability = 0.9
-    token_probability = 0.3
-    config = {
-        Keys.CELL_PROBABILITY: cell_probability,
-        Keys.TOKEN_PROBABILITY: token_probability,
-    }
-    df = pd.DataFrame({"column": data})
-    noised_data, _ = NOISE_TYPES.make_ocr_errors(df, config, RANDOMNESS0, "dataset", "column")
-
-    assert noised_data.isin(
-        pathways.keys()
-    ).all(), f"Unexpected results for {string}: {set(noised_data) - set(pathways.keys())}"
-    for result, (num_noised, num_not_noised) in pathways.items():
-        pathway_probability = (
-            token_probability**num_noised * (1 - token_probability) ** num_not_noised
-        )
-        probability = pathway_probability * cell_probability
-        if result == string:
-            # If cell is not selected, we end up with this result
-            probability += 1 - cell_probability
-
-        fuzzy_checker.fuzzy_assert_proportion(
-            name="test_ocr_replacement_values",
-            observed_numerator=(noised_data == result).sum(),
-            observed_denominator=len(data),
-            target_proportion=probability,
-            name_additional=f"result {result} from string {string}",
-        )
+    _check_pathways(
+        string,
+        pathways,
+        NOISE_TYPES.make_ocr_errors,
+        fuzzy_checker,
+        "test_ocr_replacement_values",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1204,75 +939,50 @@ def test_ocr_replacement_values(pair, fuzzy_checker: FuzzyChecker):
     ],
 )
 def test_make_typos(dummy_dataset, column, fuzzy_checker: FuzzyChecker):
-    config = get_configuration()
-    config.update(
-        {
-            DATASETS.census.name: {
-                Keys.COLUMN_NOISE: {
-                    column: {
-                        NOISE_TYPES.make_typos.name: {
-                            Keys.CELL_PROBABILITY: 0.1,
-                            Keys.TOKEN_PROBABILITY: 0.1,
-                        },
-                    },
-                },
-            },
-        }
-    )
-    config = config[DATASETS.census.name][Keys.COLUMN_NOISE][column][
-        NOISE_TYPES.make_typos.name
-    ]
-    data = dummy_dataset[[column]]
-    noised_data, _ = NOISE_TYPES.make_typos(data, config, RANDOMNESS0, "dataset", column)
-    data = data.squeeze()
+    config = _token_noise_config(column, NOISE_TYPES.make_typos, 0.1, 0.1)
+    data = dummy_dataset.select(ROW_ID, column)
+    noised_data = _noise(NOISE_TYPES.make_typos, data, config, RANDOMNESS0, "dataset", column)
+    original = data[column]
 
-    not_missing_idx = data.index[(data.notna()) & (data != "")]
-    check_original = data.loc[not_missing_idx]
-    check_noised = noised_data.loc[not_missing_idx]
+    not_missing = original.is_not_null()
+    check_original = original.filter(not_missing)
+    check_noised = noised_data.filter(not_missing)
 
     # Check for expected noise level
     cell_probability = config[Keys.CELL_PROBABILITY]
     token_probability = config[Keys.TOKEN_PROBABILITY]
-    qwerty_tokens = pd.Series(load_qwerty_errors_data().index)
-    data_series = (
-        pd.Series(INTEGERS_LIST) if column == "numbers" else pd.Series(CHARACTERS_LIST)
+    tokens_per_string = _number_of_tokens_per_string(
+        load_qwerty_errors_data()[TOKEN], EQUALLY_LIKELY_VALUES[column]
     )
-    tokens_per_string = number_of_tokens_per_string(qwerty_tokens, data_series)
-    avg_probability_any_token_noised = (
-        1 - (1 - token_probability) ** tokens_per_string
-    ).mean()
-    expected_noise = cell_probability * avg_probability_any_token_noised
-    actual_noise = (check_noised != check_original).sum()
+    avg_probability_any_token_noised = sum(
+        1 - (1 - token_probability) ** n for n in tokens_per_string
+    ) / len(tokens_per_string)
     fuzzy_checker.fuzzy_assert_proportion(
         name="make_typos",
-        observed_numerator=actual_noise,
+        observed_numerator=(check_noised != check_original).sum(),
         observed_denominator=len(check_original),
-        target_proportion=expected_noise,
+        target_proportion=cell_probability * avg_probability_any_token_noised,
     )
 
     # Check for expected string growth due to keeping original noised token
-    assert (check_noised.str.len() >= check_original.str.len()).all()
+    noised_lengths = check_noised.str.len_chars()
+    original_lengths = check_original.str.len_chars()
+    assert (noised_lengths >= original_lengths).all()
     # TODO: remove this hard-coding
     p_include_original_token = 0.1
     p_token_does_not_increase_string_length = 1 - token_probability * p_include_original_token
-    p_strings_do_not_increase_length = (
-        p_token_does_not_increase_string_length**tokens_per_string
-    )  # pd.Series
-    p_strings_increase_length = (1 - p_strings_do_not_increase_length).mean()
-    expected_changed_length = cell_probability * p_strings_increase_length
-    actual_changed_length = (check_noised.str.len() != check_original.str.len()).sum()
+    p_strings_increase_length = sum(
+        1 - p_token_does_not_increase_string_length**n for n in tokens_per_string
+    ) / len(tokens_per_string)
     fuzzy_checker.fuzzy_assert_proportion(
         name="make_typos_string_length",
-        observed_numerator=actual_changed_length,
+        observed_numerator=(noised_lengths != original_lengths).sum(),
         observed_denominator=len(check_original),
-        target_proportion=expected_changed_length,
+        target_proportion=cell_probability * p_strings_increase_length,
     )
 
     # Check that we did not touch the missing data
-    assert (
-        data.loc[~data.index.isin(not_missing_idx)]
-        == noised_data.loc[~noised_data.index.isin(not_missing_idx)]
-    ).all()
+    assert noised_data.filter(~not_missing).is_null().all()
 
 
 @pytest.mark.parametrize(
@@ -1303,35 +1013,28 @@ def test_seeds_behave_as_expected(noise_type, data_col, dataset, dataset_col, du
     """Tests that different seeds produce different results and the same seed
     produces the same results
     """
-    if data_col == "todo":
-        pytest.skip(reason=f"TODO: implement for {noise_type}")
     noise = noise_type.name
     config = get_configuration()[dataset][Keys.COLUMN_NOISE][dataset_col][noise]
     if noise == NOISE_TYPES.copy_from_household_member.name:
-        data = dummy_dataset[[data_col, COPY_HOUSEHOLD_MEMBER_COLS[data_col]]]
+        data = dummy_dataset.select(ROW_ID, data_col, COPY_HOUSEHOLD_MEMBER_COLS[data_col])
     else:
-        data = dummy_dataset[[data_col]]
+        data = dummy_dataset.select(ROW_ID, data_col)
 
-    noised_data, _ = noise_type(data, config, RANDOMNESS0, dataset, data_col)
-    noised_data_same_seed, _ = noise_type(data, config, RANDOMNESS0, dataset, data_col)
-    noised_data_different_seed, _ = noise_type(data, config, RANDOMNESS1, dataset, data_col)
-    data = data[data_col]
+    noised_data = _noise(noise_type, data, config, RANDOMNESS0, dataset, data_col)
+    noised_data_same_seed = _noise(noise_type, data, config, RANDOMNESS0, dataset, data_col)
+    noised_data_different_seed = _noise(
+        noise_type, data, config, RANDOMNESS1, dataset, data_col
+    )
+    original = data[data_col]
 
-    assert (noised_data != data).any()
-    assert (noised_data.isna() == noised_data_same_seed.isna()).all()
+    assert noised_data.ne_missing(original).any()
+    assert noised_data.equals(noised_data_same_seed)
+    assert noised_data.ne_missing(noised_data_different_seed).any()
+
+    # Check that different seeds noise different cells
     assert (
-        noised_data[noised_data.notna()]
-        == noised_data_same_seed[noised_data_same_seed.notna()]
-    ).all()
-    assert (noised_data != noised_data_different_seed).any()
-
-    # Check that we are in fact getting different noised values
-    noised = noised_data.loc[noised_data != data].reset_index(drop=True)
-    noised_different_seed = noised_data_different_seed.loc[
-        noised_data_different_seed != data
-    ].reset_index(drop=True)
-    shortest = min(len(noised), len(noised_different_seed))
-    assert (noised.iloc[:shortest] != noised_different_seed.iloc[:shortest]).any()
+        noised_data.ne_missing(original) != noised_data_different_seed.ne_missing(original)
+    ).any()
 
 
 def test_age_write_wrong_digits(dummy_dataset, fuzzy_checker: FuzzyChecker):
@@ -1354,58 +1057,22 @@ def test_age_write_wrong_digits(dummy_dataset, fuzzy_checker: FuzzyChecker):
     config = config[DATASETS.census.name][Keys.COLUMN_NOISE]["age"][
         NOISE_TYPES.write_wrong_digits.name
     ]
-    data = dummy_dataset[["age"]]
-    noised_data, _ = NOISE_TYPES.write_wrong_digits(
-        data, config, RANDOMNESS0, "dataset", "age"
+    data = dummy_dataset.select(ROW_ID, "age")
+    noised_data = _noise(
+        NOISE_TYPES.write_wrong_digits, data, config, RANDOMNESS0, "dataset", "age"
     )
-    # Calculate expected noise level
-    data = data.squeeze()
-    missing_mask = data.isnull()
-    check_original = data[~missing_mask].astype(int).astype(str)
-    check_noised = noised_data[~missing_mask]
-    expected_noise = (check_original != check_noised).sum()
-    cell_probability = config[Keys.CELL_PROBABILITY]
+    original = data["age"]
+    missing = original.is_null()
+    check_original = original.filter(~missing)
+    check_noised = noised_data.filter(~missing)
     token_probability = config[Keys.TOKEN_PROBABILITY]
-    tokens_per_string = check_original.astype(str).str.len()
+    tokens_per_string = check_original.str.len_chars()
     avg_probability_any_token_noised = (
-        1 - (1 - token_probability) ** tokens_per_string
+        1 - (1 - token_probability) ** tokens_per_string.cast(pl.Float64)
     ).mean()
     fuzzy_checker.fuzzy_assert_proportion(
         name="write_wrong_digits_age",
-        observed_numerator=expected_noise,
+        observed_numerator=(check_original != check_noised).sum(),
         observed_denominator=len(check_original),
-        target_proportion=cell_probability * avg_probability_any_token_noised,
+        target_proportion=config[Keys.CELL_PROBABILITY] * avg_probability_any_token_noised,
     )
-
-
-################
-### Wrappers ###
-################
-
-
-def number_of_tokens_per_string(s1, s2):
-    """
-    Calculates the number of tokens in each string of a series.
-    s1 is a pd.Series of tokens and we want to see how many tokens exist in each
-    string of s2.
-    """
-
-    number_of_tokens = pd.Series(0, index=[str(i) for i in s2])
-    for token in s1:
-        orig_token = str(token)
-        for s in s2:
-            string = str(s)
-            number_of_tokens.loc[string] += occurrences(string, orig_token)
-
-    return number_of_tokens
-
-
-# https://stackoverflow.com/a/2970542/
-def occurrences(string, sub):
-    count = start = 0
-    while True:
-        start = string.find(sub, start) + 1
-        if start > 0:
-            count += 1
-        else:
-            return count

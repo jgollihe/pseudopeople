@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-import yaml
 from packaging.version import parse
 
 from pseudopeople.constants.metadata import DatasetNames
