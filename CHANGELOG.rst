@@ -1,3 +1,15 @@
+**2.0.0 - Unreleased**
+
+ - Replace pandas with Polars: dataset generation functions return a ``polars.DataFrame``
+ - Remove the Dask engine and the ``engine`` parameter
+ - Add ``output_path`` to write noised datasets to parquet, one file per input data file,
+   returning a ``polars.LazyFrame``
+ - Add ``n_workers`` to noise several input data files at once
+ - Missing values are always nulls (previously a mix of NaN and empty strings in inputs)
+ - Randomness is derived from Polars hashing; the same seed reproduces the same
+   output only with the same Polars version (pinned in ``uv.lock``)
+ - Use pyproject.toml and uv for packaging and development; drop setup.py and tox
+
 **1.3.1 - 10/16/26**
 
  - Require pytest-vivarium 0.3.1 or newer so the parallel test worker cap is always applied

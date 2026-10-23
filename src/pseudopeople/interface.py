@@ -19,7 +19,7 @@ from pseudopeople.constants.noise_type_metadata import (
 )
 from pseudopeople.dtypes import DtypeNames, to_polars_dtype
 from pseudopeople.exceptions import DataSourceError
-from pseudopeople.loader import load_standard_dataset
+from pseudopeople.loader import scan_standard_dataset
 from pseudopeople.noise import noise_dataset
 from pseudopeople.schema_entities import COLUMNS, DATASETS, Dataset
 from pseudopeople.utilities import (
@@ -96,22 +96,20 @@ def _generate_dataset(
     def noise_shard(data_file_index: int) -> Union[pl.DataFrame, Path, None]:
         data_file_path = data_file_paths[data_file_index]
         logger.debug(f"Loading data from {data_file_path}.")
-        data = load_standard_dataset(data_file_path, user_filters)
-        if data.is_empty():
-            return None
+        data = scan_standard_dataset(data_file_path, user_filters)
         # Use a different seed for each data file/shard, otherwise the randomness will duplicate
         # and the Nth row in each shard will get the same noise
         data_path_seed = f"{seed}_{data_file_index}"
-        noised_data = _coerce_dtypes(
-            _prep_and_noise_dataset(
-                data,
-                dataset,
-                configuration_tree,
-                data_path_seed,
-                progress_bar=len(data_file_paths) == 1,
-            ),
+        noised_data = _prep_and_noise_dataset(
+            data,
             dataset,
+            configuration_tree,
+            data_path_seed,
+            progress_bar=len(data_file_paths) == 1,
         )
+        if noised_data is None:
+            return None
+        noised_data = _coerce_dtypes(noised_data, dataset)
         if output_path is None:
             return noised_data
         file_path = output_path / f"{dataset.name}_{data_file_index}.parquet"
@@ -146,14 +144,21 @@ def _generate_dataset(
 
 
 def _prep_and_noise_dataset(
-    data: pl.DataFrame,
+    data: Union[pl.DataFrame, pl.LazyFrame],
     dataset: Dataset,
     configuration_tree: ConfigTree,
     seed: Any,
     progress_bar: bool = True,
-) -> pl.DataFrame:
+) -> Optional[pl.DataFrame]:
+    """Noises the data, or returns None if there is none (e.g. after filtering)."""
     data = _reformat_dates_for_noising(data, dataset)
     data = _clean_input_data(data, dataset)
+    if isinstance(data, pl.LazyFrame):
+        # Doing the prep as part of the parquet scan avoids materializing
+        # intermediate copies of every string column.
+        data = data.collect()
+    if data.is_empty():
+        return None
     noised_data = noise_dataset(
         dataset, data, configuration_tree, seed, progress_bar=progress_bar
     )
@@ -213,30 +218,31 @@ def _string_columns_for_noising(dataset: Dataset) -> Dict[str, str]:
 
 
 def _clean_input_data(
-    data: pl.DataFrame,
+    data: Union[pl.DataFrame, pl.LazyFrame],
     dataset: Dataset,
-) -> pl.DataFrame:
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """
     Puts input data in the form noising expects: all missing values are nulls,
     categorical (dictionary-encoded) columns are plain strings, and output
     string columns are strings.
     """
-    categorical = [
-        c for c, dtype in data.schema.items() if dtype in (pl.Categorical, pl.Enum)
-    ]
-    data = data.with_columns(pl.col(categorical).cast(pl.String))
-    data = data.with_columns(
-        to_string_expr(
-            column, data.schema[column], integer_valued=output_column in INT_TO_STRING_COLUMNS
-        )
-        for column, output_column in _string_columns_for_noising(dataset).items()
-        if column in data.columns and data.schema[column] != pl.String
-    )
-    # Coerce empty strings to nulls
+    string_columns = _string_columns_for_noising(dataset)
+
+    def cleaned(column: str, dtype: pl.DataType) -> pl.Expr:
+        expr = pl.col(column)
+        if dtype in (pl.Categorical, pl.Enum):
+            expr, dtype = expr.cast(pl.String), pl.String()
+        elif column in string_columns and dtype != pl.String:
+            integer_valued = string_columns[column] in INT_TO_STRING_COLUMNS
+            expr = to_string_expr(column, dtype, integer_valued=integer_valued)
+            dtype = pl.String()
+        if dtype == pl.String:
+            # Coerce empty strings to nulls
+            expr = pl.when(expr != "").then(expr)
+        return expr.alias(column)
+
     return data.with_columns(
-        pl.when(pl.col(c) != "").then(pl.col(c)).alias(c)
-        for c, dtype in data.schema.items()
-        if dtype == pl.String
+        cleaned(column, dtype) for column, dtype in data.collect_schema().items()
     )
 
 
@@ -255,7 +261,9 @@ def _coerce_dtypes(
     )
 
 
-def _reformat_dates_for_noising(data: pl.DataFrame, dataset: Dataset) -> pl.DataFrame:
+def _reformat_dates_for_noising(
+    data: Union[pl.DataFrame, pl.LazyFrame], dataset: Dataset
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """Formats date columns so they can be noised as strings."""
     if dataset.date_format not in (
         DATEFORMATS.YYYYMMDD,
@@ -263,12 +271,13 @@ def _reformat_dates_for_noising(data: pl.DataFrame, dataset: Dataset) -> pl.Data
         DATEFORMATS.MMDDYYYY,
     ):
         raise ValueError(f"Invalid date format in {dataset.name}.")
+    schema = data.collect_schema()
     date_columns = []
     for date_column in [COLUMNS.dob.name, COLUMNS.ssa_event_date.name]:
         # Format both the actual column, and the shadow version that will be used
         # to copy from a household member
         for column in [date_column, COPY_HOUSEHOLD_MEMBER_COLS.get(date_column)]:
-            if column in data.columns and data.schema[column].is_temporal():
+            if column in schema and schema[column].is_temporal():
                 date_columns.append(column)
     return data.with_columns(pl.col(date_columns).dt.strftime(dataset.date_format))
 

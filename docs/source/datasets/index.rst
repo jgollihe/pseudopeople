@@ -167,7 +167,7 @@ The following columns are included in this dataset:
    * - Survey date
      - :code:`survey_date`
      - Date on which the survey was conducted; metadata that would not be collected directly; not affected by noise.
-       Stored as a ``pandas.Timestamp``, which displays in YYYY-MM-DD format by default.
+       Stored as a Polars ``Datetime``, which displays in YYYY-MM-DD format by default.
    * - First name
      - :code:`first_name`
      -
@@ -259,7 +259,7 @@ The following columns are included in this dataset:
    * - Survey date
      - :code:`survey_date`
      - Date on which the survey was conducted; metadata that would not be collected directly; not affected by noise.
-       Stored as a ``pandas.Timestamp``, which displays in YYYY-MM-DD format by default.
+       Stored as a Polars ``Datetime``, which displays in YYYY-MM-DD format by default.
    * - First name
      - :code:`first_name`
      -

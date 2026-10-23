@@ -28,10 +28,10 @@ def filters_to_expr(user_filters: List[Tuple[str, str, Any]]) -> pl.Expr:
     return pl.all_horizontal(predicates) if predicates else pl.lit(True)
 
 
-def load_standard_dataset(
+def scan_standard_dataset(
     data_path: Path,
     user_filters: List[Tuple],
-) -> pl.DataFrame:
+) -> pl.LazyFrame:
     if data_path.suffix != ".parquet":
         raise DataSourceError(
             f"Source path must be a .parquet file. Provided {data_path.suffix}"
@@ -43,4 +43,11 @@ def load_standard_dataset(
     if user_filters:
         # Pushed down into the parquet scan, so only matching row groups are read
         data = data.filter(filters_to_expr(user_filters))
-    return data.collect()
+    return data
+
+
+def load_standard_dataset(
+    data_path: Path,
+    user_filters: List[Tuple],
+) -> pl.DataFrame:
+    return scan_standard_dataset(data_path, user_filters).collect()
